@@ -6,7 +6,16 @@ import App from "./App";
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
-    <MantineProvider>
+    <MantineProvider
+      defaultColorScheme="light"
+      theme={{
+        primaryColor: "blue",
+        fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Arial, sans-serif",
+        headings: {
+          fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Helvetica Neue', Arial, sans-serif",
+        },
+      }}
+    >
       <App />
     </MantineProvider>
   </React.StrictMode>,
