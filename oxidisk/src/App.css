@@ -13,6 +13,136 @@
   font-variant-numeric: tabular-nums;
 }
 
+:root {
+  --oxidisk-apfs: #5aa7ff;
+  --oxidisk-exfat: #34d399;
+  --oxidisk-fat32: #fbbf24;
+  --oxidisk-ntfs: #22d3ee;
+  --oxidisk-ext4: #fb923c;
+  --oxidisk-btrfs: #f472b6;
+  --oxidisk-xfs: #a78bfa;
+  --oxidisk-f2fs: #f87171;
+  --oxidisk-swap: #94a3b8;
+  --oxidisk-unknown: #cbd5f5;
+  --oxidisk-unallocated: #e5e7eb;
+  --oxidisk-bar-border: #e2e8f0;
+  --oxidisk-card-active: rgba(37, 99, 235, 0.08);
+}
+
+.device-card {
+  cursor: pointer;
+  transition: border-color 0.2s ease, background-color 0.2s ease;
+}
+
+.device-card:hover {
+  border-color: var(--mantine-color-blue-4);
+}
+
+.device-card--active {
+  border-color: var(--mantine-color-blue-6);
+  background-color: var(--oxidisk-card-active);
+}
+
+.partition-bar {
+  background: var(--mantine-color-body);
+}
+
+.partition-bar__track {
+  display: flex;
+  align-items: stretch;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid var(--oxidisk-bar-border);
+  height: 52px;
+  min-width: 520px;
+  width: max-content;
+}
+
+.partition-bar__scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 6px;
+}
+
+.partition-segment {
+  appearance: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 600;
+  color: #0f172a;
+  cursor: pointer;
+  transition: filter 0.2s ease, box-shadow 0.2s ease;
+  min-width: 6px;
+  flex: 0 0 auto;
+  position: relative;
+}
+
+.partition-segment:hover {
+  filter: brightness(0.97);
+}
+
+.partition-segment--selected {
+  box-shadow: inset 0 0 0 2px rgba(15, 23, 42, 0.45);
+}
+
+.partition-segment--locked {
+  filter: grayscale(0.2) brightness(0.96);
+  opacity: 0.75;
+}
+
+.partition-segment__lock {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  color: rgba(15, 23, 42, 0.7);
+}
+
+.partition-segment__label {
+  padding: 0 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.partition-table tbody tr[data-selected="true"] {
+  background: rgba(59, 130, 246, 0.08);
+}
+
+.partition-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+}
+
+.wizard-card {
+  background: var(--mantine-color-body);
+}
+
+.dropzone {
+  cursor: pointer;
+  transition: border-color 0.2s ease, background-color 0.2s ease;
+}
+
+.dropzone:hover {
+  border-color: var(--mantine-color-blue-5);
+}
+
+.dropzone--active {
+  background-color: rgba(59, 130, 246, 0.08);
+  border-color: var(--mantine-color-blue-5);
+}
+
+.hero-action {
+  background: linear-gradient(120deg, rgba(59, 130, 246, 0.08), rgba(14, 165, 233, 0.08));
+  border-color: rgba(59, 130, 246, 0.25);
+}
+
 @keyframes pulseOpacity {
   0% {
     opacity: 1;
@@ -25,7 +155,7 @@
   }
 }
 :root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
   font-size: 16px;
   line-height: 24px;
   font-weight: 400;
@@ -118,6 +248,9 @@ button {
   :root {
     color: #f6f6f6;
     background-color: #2f2f2f;
+    --oxidisk-unallocated: #334155;
+    --oxidisk-bar-border: #334155;
+    --oxidisk-card-active: rgba(59, 130, 246, 0.2);
   }
 
   a:hover {

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -12,6 +13,7 @@ pub struct PartitionDevice {
     size: u64,
     internal: bool,
     content: String,
+    parent_device: Option<String>,
     partitions: Vec<PartitionEntry>,
     is_protected: bool,
     protection_reason: Option<String>,
@@ -22,6 +24,7 @@ pub struct PartitionEntry {
     identifier: String,
     name: String,
     size: u64,
+    offset: Option<u64>,
     content: String,
     mount_point: Option<String>,
     is_protected: bool,
@@ -277,8 +280,17 @@ pub fn get_partition_devices() -> Vec<PartitionDevice> {
                 .to_string();
 
             let mut partitions = Vec::new();
+            let partition_offsets = partition_offsets_for_disk(&identifier);
             let mut device_protected = false;
             let mut device_protection_reason: Option<String> = None;
+            let parent_device = disk_dict
+                .get("APFSPhysicalStores")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.get(0))
+                .and_then(|v| v.as_dictionary())
+                .and_then(|d| d.get("DeviceIdentifier"))
+                .and_then(|v| v.as_string())
+                .map(|s| s.to_string());
             if let Some(Value::Array(parts)) = disk_dict.get("Partitions") {
                 for part in parts {
                     let part_dict = match part.as_dictionary() {
@@ -309,6 +321,8 @@ pub fn get_partition_devices() -> Vec<PartitionDevice> {
                         .unwrap_or("unknown")
                         .to_string();
 
+                    let part_offset = partition_offsets.get(&part_id).map(|entry| entry.0);
+
                     let mount_point = part_dict
                         .get("MountPoint")
                         .and_then(|v| v.as_string())
@@ -327,6 +341,7 @@ pub fn get_partition_devices() -> Vec<PartitionDevice> {
                         identifier: part_id,
                         name: part_name,
                         size: part_size,
+                        offset: part_offset,
                         content: part_content,
                         mount_point,
                         is_protected: protection.0,
@@ -341,6 +356,7 @@ pub fn get_partition_devices() -> Vec<PartitionDevice> {
                 size,
                 internal,
                 content,
+                parent_device,
                 partitions,
                 is_protected: device_protected,
                 protection_reason: device_protection_reason,
@@ -405,6 +421,70 @@ fn partition_fs_type(identifier: &str) -> Option<String> {
     }
 
     None
+}
+
+#[cfg(target_os = "macos")]
+fn partition_offsets_for_disk(disk_identifier: &str) -> HashMap<String, (u64, u64)> {
+    use plist::Value;
+
+    let device = if disk_identifier.starts_with("/dev/") {
+        disk_identifier.to_string()
+    } else {
+        format!("/dev/{disk_identifier}")
+    };
+
+    let output = Command::new("diskutil")
+        .args(["list", "-plist", &device])
+        .output();
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return HashMap::new(),
+    };
+
+    let plist = match Value::from_reader_xml(&output.stdout[..]) {
+        Ok(p) => p,
+        Err(_) => return HashMap::new(),
+    };
+
+    let dict = match plist.as_dictionary() {
+        Some(d) => d,
+        None => return HashMap::new(),
+    };
+
+    let partitions = match dict.get("Partitions") {
+        Some(Value::Array(parts)) => parts,
+        _ => return HashMap::new(),
+    };
+
+    let mut offsets = HashMap::new();
+    for part in partitions {
+        if let Some(part_dict) = part.as_dictionary() {
+            let identifier = part_dict
+                .get("DeviceIdentifier")
+                .and_then(|v| v.as_string())
+                .unwrap_or("")
+                .to_string();
+            let offset = part_dict
+                .get("PartitionOffset")
+                .and_then(|v| v.as_unsigned_integer())
+                .unwrap_or(0);
+            let size = part_dict
+                .get("PartitionSize")
+                .and_then(|v| v.as_unsigned_integer())
+                .unwrap_or(0);
+
+            if !identifier.is_empty() && size > 0 {
+                offsets.insert(identifier, (offset, size));
+            }
+        }
+    }
+
+    offsets
+}
+
+#[cfg(not(target_os = "macos"))]
+fn partition_offsets_for_disk(_disk_identifier: &str) -> HashMap<String, (u64, u64)> {
+    HashMap::new()
 }
 
 #[cfg(target_os = "macos")]

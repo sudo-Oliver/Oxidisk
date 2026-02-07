@@ -10,9 +10,9 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
       defaultColorScheme="light"
       theme={{
         primaryColor: "blue",
-        fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Arial, sans-serif",
+        fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif",
         headings: {
-          fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Helvetica Neue', Arial, sans-serif",
+          fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif",
         },
       }}
     >

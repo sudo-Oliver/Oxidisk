@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import type { DragEvent } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { sendNotification } from "@tauri-apps/plugin-notification";
@@ -32,6 +33,7 @@ import {
   Slider,
   NumberInput,
   Badge,
+  Table,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import {
@@ -85,6 +87,7 @@ interface PartitionEntry {
   identifier: string;
   name: string;
   size: number;
+  offset?: number | null;
   content: string;
   mount_point?: string | null;
   is_protected: boolean;
@@ -97,6 +100,7 @@ interface PartitionDevice {
   size: number;
   internal: boolean;
   content: string;
+  parent_device?: string | null;
   partitions: PartitionEntry[];
   is_protected: boolean;
   protection_reason?: string | null;
@@ -194,6 +198,140 @@ function formatEta(seconds: number | null) {
   return `${mins}m ${secs}s`;
 }
 
+function fsTypeFromPartition(partition: PartitionEntry | null) {
+  if (!partition) return "unknown";
+  const normalized = (partition.fs_type ?? partition.content ?? "").toLowerCase();
+  if (normalized.includes("apfs")) return "apfs";
+  if (normalized.includes("exfat")) return "exfat";
+  if (normalized.includes("ms-dos") || normalized.includes("fat32") || normalized.includes("fat")) return "fat32";
+  if (normalized.includes("ntfs")) return "ntfs";
+  if (normalized.includes("ext4") || normalized.includes("linux")) return "ext4";
+  if (normalized.includes("btrfs")) return "btrfs";
+  if (normalized.includes("xfs")) return "xfs";
+  if (normalized.includes("f2fs")) return "f2fs";
+  if (normalized.includes("swap")) return "swap";
+  return "unknown";
+}
+
+type PartitionSegment = {
+  key: string;
+  label: string;
+  size: number;
+  offset: number;
+  fsType: string;
+  kind: "partition" | "unallocated";
+  partition?: PartitionEntry;
+};
+
+function fsColorForSegment(fsType: string, kind: "partition" | "unallocated") {
+  if (kind === "unallocated") return "var(--oxidisk-unallocated)";
+  switch (fsType) {
+    case "apfs":
+      return "var(--oxidisk-apfs)";
+    case "exfat":
+      return "var(--oxidisk-exfat)";
+    case "fat32":
+      return "var(--oxidisk-fat32)";
+    case "ntfs":
+      return "var(--oxidisk-ntfs)";
+    case "ext4":
+      return "var(--oxidisk-ext4)";
+    case "btrfs":
+      return "var(--oxidisk-btrfs)";
+    case "xfs":
+      return "var(--oxidisk-xfs)";
+    case "f2fs":
+      return "var(--oxidisk-f2fs)";
+    case "swap":
+      return "var(--oxidisk-swap)";
+    default:
+      return "var(--oxidisk-unknown)";
+  }
+}
+
+function fsLabelForType(fsType: string, kind: "partition" | "unallocated") {
+  if (kind === "unallocated") return "Unallocated";
+  switch (fsType) {
+    case "apfs":
+      return "APFS";
+    case "exfat":
+      return "exFAT";
+    case "fat32":
+      return "FAT32";
+    case "ntfs":
+      return "NTFS";
+    case "ext4":
+      return "ext4";
+    case "btrfs":
+      return "Btrfs";
+    case "xfs":
+      return "XFS";
+    case "f2fs":
+      return "F2FS";
+    case "swap":
+      return "Swap";
+    default:
+      return "Unknown";
+  }
+}
+
+function buildPartitionSegments(device: PartitionDevice | null): PartitionSegment[] {
+  if (!device) return [];
+  const partitions = device.partitions.map((part) => ({
+    partition: part,
+    offset: part.offset ?? null,
+    size: part.size,
+  }));
+  const hasOffsets = partitions.every((part) => part.offset != null);
+  const sorted = hasOffsets
+    ? [...partitions].sort((a, b) => (a.offset ?? 0) - (b.offset ?? 0))
+    : [...partitions];
+
+  const segments: PartitionSegment[] = [];
+  let cursor = 0;
+
+  for (const entry of sorted) {
+    const offset = entry.offset ?? cursor;
+    if (offset > cursor) {
+      segments.push({
+        key: `unallocated-${cursor}`,
+        label: "Unallocated",
+        size: offset - cursor,
+        offset: cursor,
+        fsType: "unallocated",
+        kind: "unallocated",
+      });
+    }
+
+    const part = entry.partition;
+    const fsType = fsTypeFromPartition(part);
+    segments.push({
+      key: part.identifier,
+      label: part.name || part.identifier,
+      size: part.size,
+      offset,
+      fsType,
+      kind: "partition",
+      partition: part,
+    });
+
+    cursor = offset + entry.size;
+  }
+
+  if (cursor < device.size) {
+    segments.push({
+      key: `unallocated-${cursor}`,
+      label: "Unallocated",
+      size: device.size - cursor,
+      offset: cursor,
+      fsType: "unallocated",
+      kind: "unallocated",
+    });
+  }
+
+  return segments;
+}
+
 function renderImageBrandIcon(brand: string | null) {
   switch (brand) {
     case "ubuntu":
@@ -231,6 +369,10 @@ export default function App() {
   const [showSystemVolumes, setShowSystemVolumes] = useState(false);
   const [partitionDevices, setPartitionDevices] = useState<PartitionDevice[]>([]);
   const [partitionLoading, setPartitionLoading] = useState(false);
+  const [selectedPartitionDeviceId, setSelectedPartitionDeviceId] = useState<string | null>(null);
+  const [selectedPartitionId, setSelectedPartitionId] = useState<string | null>(null);
+  const [selectedUnallocated, setSelectedUnallocated] = useState<{ offset: number; size: number } | null>(null);
+  const [partitionBarWidth, setPartitionBarWidth] = useState(0);
   const [preflightResult, setPreflightResult] = useState<PreflightResult | null>(null);
   const [preflightKey, setPreflightKey] = useState<string | null>(null);
   const [preflightRunning, setPreflightRunning] = useState(false);
@@ -286,6 +428,7 @@ export default function App() {
   const [imageHash, setImageHash] = useState<string | null>(null);
   const [imageHashError, setImageHashError] = useState<string | null>(null);
   const [imageHashRunning, setImageHashRunning] = useState(false);
+  const [imageDropActive, setImageDropActive] = useState(false);
   const [imageWindowsDetected, setImageWindowsDetected] = useState(false);
   const [imageWindowsReason, setImageWindowsReason] = useState<string | null>(null);
   const [imageBrand, setImageBrand] = useState<string | null>(null);
@@ -349,6 +492,7 @@ export default function App() {
   const [progressEta, setProgressEta] = useState<number | null>(null);
   const lastProgressRef = useRef<{ time: number; bytes: number } | null>(null);
   const imageRunningRef = useRef(false);
+  const partitionBarRef = useRef<HTMLDivElement | null>(null);
   const [clipboardPartition, setClipboardPartition] = useState<PartitionEntry | null>(null);
   const [clipboardFs, setClipboardFs] = useState<string | null>(null);
   const [pasteWizardOpen, setPasteWizardOpen] = useState(false);
@@ -524,21 +668,6 @@ export default function App() {
     }
   }
 
-  function fsTypeFromPartition(partition: PartitionEntry | null) {
-    if (!partition) return "unknown";
-    const normalized = (partition.fs_type ?? partition.content ?? "").toLowerCase();
-    if (normalized.includes("apfs")) return "apfs";
-    if (normalized.includes("exfat")) return "exfat";
-    if (normalized.includes("ms-dos") || normalized.includes("fat32") || normalized.includes("fat")) return "fat32";
-    if (normalized.includes("ntfs")) return "ntfs";
-    if (normalized.includes("ext4") || normalized.includes("linux")) return "ext4";
-    if (normalized.includes("btrfs")) return "btrfs";
-    if (normalized.includes("xfs")) return "xfs";
-    if (normalized.includes("f2fs")) return "f2fs";
-    if (normalized.includes("swap")) return "swap";
-    return "unknown";
-  }
-
   function baseDiskIdentifier(identifier: string) {
     const match = identifier.match(/^(disk\d+)/);
     return match ? match[1] : identifier;
@@ -636,46 +765,61 @@ export default function App() {
         filters: [{ name: "Images", extensions: ["iso", "img", "dmg", "dd"] }],
       });
       if (typeof selected === "string") {
-        setImagePath(selected);
-        setImageError(null);
-        setImageSuccess(null);
-        setImageHash(null);
-        setImageHashError(null);
-        setImageWindowsDetected(false);
-        setImageWindowsReason(null);
-        setImageBrand(null);
-        setImageLabel(null);
-        setImageWindowsOverride(false);
-        setImageWindowsSheetConfirmed(false);
-        try {
-          const result = await invoke<{
-            details?: {
-              isWindows?: boolean;
-              reason?: string | null;
-              brand?: string | null;
-              label?: string | null;
-            };
-          }>(
-            "inspect_image",
-            { sourcePath: selected }
-          );
-          const isWindows = !!result?.details?.isWindows;
-          const reason = result?.details?.reason ?? null;
-          const brand = result?.details?.brand ?? null;
-          const label = result?.details?.label ?? null;
-          setImageWindowsDetected(isWindows);
-          setImageWindowsReason(reason);
-          setImageBrand(brand);
-          setImageLabel(label);
-        } catch (error) {
-          setImageWindowsDetected(false);
-          setImageWindowsReason(null);
-          setImageBrand(null);
-          setImageLabel(null);
-        }
+        await setImageFile(selected);
       }
     } catch (error) {
       setImageError(String(error));
+    }
+  }
+
+  async function handleImageDrop(event: DragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    setImageDropActive(false);
+    const file = event.dataTransfer.files?.[0];
+    const filePath = (file as File & { path?: string }).path;
+    if (filePath) {
+      await setImageFile(filePath);
+    }
+  }
+
+  async function setImageFile(selected: string) {
+    setImagePath(selected);
+    setImageError(null);
+    setImageSuccess(null);
+    setImageHash(null);
+    setImageHashError(null);
+    setImageWindowsDetected(false);
+    setImageWindowsReason(null);
+    setImageBrand(null);
+    setImageLabel(null);
+    setImageWindowsOverride(false);
+    setImageWindowsSheetConfirmed(false);
+    try {
+      const result = await invoke<{
+        details?: {
+          isWindows?: boolean;
+          reason?: string | null;
+          brand?: string | null;
+          label?: string | null;
+        };
+      }>(
+        "inspect_image",
+        { sourcePath: selected }
+      );
+      const isWindows = !!result?.details?.isWindows;
+      const reason = result?.details?.reason ?? null;
+      const brand = result?.details?.brand ?? null;
+      const label = result?.details?.label ?? null;
+      setImageWindowsDetected(isWindows);
+      setImageWindowsReason(reason);
+      setImageBrand(brand);
+      setImageLabel(label);
+    } catch (error) {
+      setImageWindowsDetected(false);
+      setImageWindowsReason(null);
+      setImageBrand(null);
+      setImageLabel(null);
     }
   }
 
@@ -721,13 +865,55 @@ export default function App() {
   }
 
   function imageTargetOptions() {
+    const isApfsContainer = (device: PartitionDevice) =>
+      device.content.toLowerCase().includes("apple_apfs_container");
+    const physicalDevices = partitionDevices.filter((device) => !isApfsContainer(device));
     const targets = showAllImageTargets
-      ? partitionDevices
-      : partitionDevices.filter((device) => !device.internal);
-    return targets.map((device) => ({
-      value: device.identifier,
-      label: `${device.identifier} · ${formatBytes(device.size)} · ${device.internal ? "Intern" : "Extern"}`,
-    }));
+      ? physicalDevices
+      : physicalDevices.filter((device) => !device.internal);
+
+    const containerMap = new Map<string, PartitionDevice[]>();
+    const orphanContainers: PartitionDevice[] = [];
+    for (const device of partitionDevices) {
+      if (!isApfsContainer(device)) continue;
+      if (device.parent_device) {
+        const list = containerMap.get(device.parent_device) ?? [];
+        list.push(device);
+        containerMap.set(device.parent_device, list);
+      } else {
+        orphanContainers.push(device);
+      }
+    }
+
+    const options: { value: string; label: string; disabled?: boolean }[] = [];
+    for (const device of targets) {
+      options.push({
+        value: device.identifier,
+        label: `${device.identifier} · ${formatBytes(device.size)} · ${device.internal ? "Intern" : "Extern"}`,
+      });
+      if (showAllImageTargets) {
+        const containers = containerMap.get(device.identifier) ?? [];
+        for (const container of containers) {
+          options.push({
+            value: `container:${container.identifier}`,
+            label: `└── APFS Container (${container.identifier})`,
+            disabled: true,
+          });
+        }
+      }
+    }
+
+    if (showAllImageTargets && orphanContainers.length > 0) {
+      for (const container of orphanContainers) {
+        options.push({
+          value: `container:${container.identifier}`,
+          label: `APFS Container (${container.identifier})`,
+          disabled: true,
+        });
+      }
+    }
+
+    return options;
   }
 
   async function submitFlashImage() {
@@ -1652,10 +1838,52 @@ export default function App() {
   }, [activeView]);
 
   useEffect(() => {
+    if (partitionDevices.length === 0) {
+      setSelectedPartitionDeviceId(null);
+      setSelectedPartitionId(null);
+      setSelectedPartition(null);
+      setSelectedUnallocated(null);
+      return;
+    }
+
+    if (!selectedPartitionDeviceId || !partitionDevices.some((dev) => dev.identifier === selectedPartitionDeviceId)) {
+      const initial = partitionDevices[0];
+      setSelectedPartitionDeviceId(initial.identifier);
+      setSelectedPartitionId(initial.partitions[0]?.identifier ?? null);
+      setSelectedPartition(initial.partitions[0] ?? null);
+      setSelectedUnallocated(null);
+    }
+  }, [partitionDevices, selectedPartitionDeviceId]);
+
+  useEffect(() => {
+    if (!selectedPartitionDeviceId) return;
+    const device = partitionDevices.find((dev) => dev.identifier === selectedPartitionDeviceId);
+    if (!device) return;
+    if (selectedPartitionId && device.partitions.some((part) => part.identifier === selectedPartitionId)) {
+      setSelectedPartition(device.partitions.find((part) => part.identifier === selectedPartitionId) ?? null);
+      return;
+    }
+    setSelectedPartitionId(device.partitions[0]?.identifier ?? null);
+    setSelectedPartition(device.partitions[0] ?? null);
+    setSelectedUnallocated(null);
+  }, [partitionDevices, selectedPartitionDeviceId, selectedPartitionId]);
+
+  useEffect(() => {
     if (imageMode !== "windows") {
       setImageWindowsSheetConfirmed(false);
     }
   }, [imageMode]);
+
+  useEffect(() => {
+    const node = partitionBarRef.current;
+    if (!node) return;
+    const update = () => setPartitionBarWidth(node.clientWidth);
+    update();
+
+    const observer = new ResizeObserver(() => update());
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [selectedPartitionDeviceId]);
 
   useEffect(() => {
     let unlisten: (() => void) | null = null;
@@ -1838,6 +2066,11 @@ export default function App() {
       </Stack>
     );
   }
+
+  const selectedPartitionDevice = selectedPartitionDeviceId
+    ? partitionDevices.find((device) => device.identifier === selectedPartitionDeviceId) ?? null
+    : null;
+  const partitionSegments = buildPartitionSegments(selectedPartitionDevice);
 
   return (
     <AppShell
@@ -3030,15 +3263,106 @@ export default function App() {
       <AppShell.Main style={{ display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden" }}>
         {activeView === "partition" && (
           <Group h="100%" gap="md" align="stretch">
-            <Paper withBorder p="md" radius="md" shadow="sm" style={{ flex: 2, display: "flex", flexDirection: "column", gap: 12 }}>
+            <Paper
+              withBorder
+              p="md"
+              radius="md"
+              shadow="sm"
+              style={{ flex: 1, minWidth: 260, display: "flex", flexDirection: "column", gap: 12 }}
+            >
+              <Group justify="space-between" align="center">
+                <div>
+                  <Text c="dimmed" size="xs" tt="uppercase" fw={700}>
+                    Laufwerke
+                  </Text>
+                  <Title order={4}>Geraete</Title>
+                </div>
+                <ActionIcon variant="light" onClick={loadPartitionDevices} aria-label="Neu laden">
+                  <IconRefresh size={18} />
+                </ActionIcon>
+              </Group>
+              <Divider />
+              {partitionLoading && (
+                <Center style={{ flex: 1 }}>
+                  <Stack align="center">
+                    <Loader size="lg" type="dots" color="orange" />
+                    <Text c="dimmed">Suche nach Geraeten…</Text>
+                  </Stack>
+                </Center>
+              )}
+              {!partitionLoading && partitionDevices.length === 0 && (
+                <Center style={{ flex: 1 }}>
+                  <Stack align="center">
+                    <ThemeIcon size={56} radius="xl" color="gray" variant="light">
+                      <IconDatabase size={28} />
+                    </ThemeIcon>
+                    <Text c="dimmed">Keine Geraete gefunden.</Text>
+                  </Stack>
+                </Center>
+              )}
+              {!partitionLoading && partitionDevices.length > 0 && (
+                <Stack gap="xs">
+                  {partitionDevices.map((device) => {
+                    const active = device.identifier === selectedPartitionDeviceId;
+                    return (
+                      <Paper
+                        key={device.identifier}
+                        withBorder
+                        radius="md"
+                        p="sm"
+                        className={active ? "device-card device-card--active" : "device-card"}
+                        onClick={() => {
+                          setSelectedPartitionDeviceId(device.identifier);
+                          setSelectedPartitionId(device.partitions[0]?.identifier ?? null);
+                            setSelectedPartition(device.partitions[0] ?? null);
+                          setSelectedUnallocated(null);
+                        }}
+                      >
+                        <Group justify="space-between" align="center" wrap="nowrap">
+                          <Group gap="sm" wrap="nowrap">
+                            <ThemeIcon
+                              size={40}
+                              radius="md"
+                              color={device.internal ? "gray" : "teal"}
+                              variant="light"
+                            >
+                              {device.internal ? <IconDatabase size={20} /> : <IconDeviceFloppy size={20} />}
+                            </ThemeIcon>
+                            <div>
+                              <Text fw={600}>{device.identifier}</Text>
+                              <Text size="xs" c="dimmed">
+                                {formatBytes(device.size)} · {device.internal ? "Intern" : "Extern"}
+                              </Text>
+                            </div>
+                          </Group>
+                          {device.is_protected && (
+                            <Tooltip label={device.protection_reason ?? "SIP geschuetzt"}>
+                              <IconLock size={14} color="var(--mantine-color-red-6)" />
+                            </Tooltip>
+                          )}
+                        </Group>
+                      </Paper>
+                    );
+                  })}
+                </Stack>
+              )}
+            </Paper>
+
+            <Paper
+              withBorder
+              p="md"
+              radius="md"
+              shadow="sm"
+              style={{ flex: 3, display: "flex", flexDirection: "column", gap: 12 }}
+            >
               <Group justify="space-between" align="center">
                 <div>
                   <Text c="dimmed" size="xs" tt="uppercase" fw={700}>
                     Partition Manager
                   </Text>
-                  <Title order={3}>Geraete und Partitionen</Title>
+                  <Title order={3}>Partitionen verwalten</Title>
                   <Text size="sm" c="dimmed">
-                    macOS: Aktionen laufen ueber privilegierten Helper. Die UI ist der Startpunkt.
+                    Aktionen laufen ueber den privilegierten Helper. Auswahl links bestimmt den Fokus.
                   </Text>
                   {clipboardPartition && (
                     <Badge color="indigo" variant="light" mt="xs">
@@ -3059,207 +3383,287 @@ export default function App() {
                   >
                     Sidecars
                   </Button>
-                  <Button variant="light" onClick={loadPartitionDevices} leftSection={<IconRefresh size={18} />}>
-                    Neu laden
-                  </Button>
                 </Group>
               </Group>
               <Divider />
 
-              {partitionLoading && (
-                <Center style={{ flex: 1 }}>
-                  <Stack align="center">
-                    <Loader size="lg" type="dots" color="orange" />
-                    <Text c="dimmed">Suche nach Geraeten…</Text>
-                  </Stack>
-                </Center>
-              )}
-
-              {!partitionLoading && partitionDevices.length === 0 && (
+              {!selectedPartitionDevice && (
                 <Center style={{ flex: 1 }}>
                   <Stack align="center">
                     <ThemeIcon size={64} radius="xl" color="gray" variant="light">
                       <IconDatabase size={32} />
                     </ThemeIcon>
-                    <Text c="dimmed">Keine Geraete gefunden.</Text>
+                    <Text c="dimmed">Bitte ein Laufwerk links auswaehlen.</Text>
                   </Stack>
                 </Center>
               )}
 
-              {!partitionLoading && partitionDevices.length > 0 && (
-                <Stack gap="sm">
-                  {partitionDevices.map((device) => (
-                    <Paper key={device.identifier} withBorder p="sm" radius="md">
-                      <Group justify="space-between" align="center">
-                        <div>
-                          <Text fw={700}>{device.identifier}</Text>
-                          <Text size="sm" c="dimmed">
-                            {formatBytes(device.size)} · {device.internal ? "Intern" : "Extern"} · {device.content}
-                          </Text>
-                          {device.is_protected && (
-                            <Group gap="xs" mt={4}>
-                              <Tooltip label={device.protection_reason ?? "SIP geschuetzt"}>
-                                <Group gap={4}>
-                                  <IconLock size={14} color="var(--mantine-color-red-6)" />
-                                  <Text size="xs" c="red">
-                                    SIP geschuetzt
-                                  </Text>
-                                </Group>
-                              </Tooltip>
-                            </Group>
-                          )}
-                        </div>
-                        <Group gap="xs">
-                          <Button
-                            size="xs"
-                            variant="light"
-                            onClick={() => openWipeWizard(device)}
-                            disabled={device.is_protected}
-                          >
-                            Geraet loeschen
-                          </Button>
-                          <Button
-                            size="xs"
-                            variant="light"
-                            disabled={device.is_protected || deviceFreeBytes(device) === 0}
-                            onClick={() => openCreateWizard(device)}
-                          >
-                            Partition erstellen
-                          </Button>
-                          <Button
-                            size="xs"
-                            variant="light"
-                            disabled={
-                              device.is_protected ||
-                              !clipboardPartition ||
-                              deviceFreeBytes(device) < (clipboardPartition?.size ?? 0)
-                            }
-                            onClick={() => openPasteWizard(device)}
-                          >
-                            Einfuegen
-                          </Button>
-                          <Button
-                            size="xs"
-                            variant="light"
-                            disabled={device.is_protected}
-                            onClick={() => openTableWizard(device)}
-                          >
-                            Partitionstabelle
-                          </Button>
-                        </Group>
-                      </Group>
-                      <Divider my="sm" />
-                      <Stack gap="xs">
-                        {device.partitions.length === 0 && <Text size="sm" c="dimmed">Keine Partitionen</Text>}
-                        {device.partitions.map((part) => (
-                          <Group key={part.identifier} justify="space-between" align="center">
-                            <div>
-                              <Text size="sm" fw={600}>
-                                {part.identifier} {part.name ? `· ${part.name}` : ""}
-                              </Text>
-                              <Text size="xs" c="dimmed">
-                                {formatBytes(part.size)} · {part.fs_type ?? part.content}
-                                {part.mount_point ? ` · ${part.mount_point}` : ""}
-                              </Text>
-                              {part.is_protected && (
-                                <Group gap="xs" mt={4}>
-                                  <Tooltip label={part.protection_reason ?? "SIP geschuetzt"}>
-                                    <Group gap={4}>
-                                      <IconLock size={12} color="var(--mantine-color-red-6)" />
-                                      <Text size="xs" c="red">
-                                        SIP geschuetzt
-                                      </Text>
-                                    </Group>
-                                  </Tooltip>
-                                </Group>
-                              )}
-                            </div>
-                            <Group gap="xs">
-                              <Button
-                                size="xs"
-                                variant="light"
-                                disabled={part.is_protected}
-                                onClick={() => copyToClipboard(part)}
-                              >
-                                Kopieren
-                              </Button>
-                              <Button
-                                size="xs"
-                                variant="light"
-                                disabled={part.is_protected}
-                                onClick={() => openFormatWizard(part)}
-                              >
-                                Formatieren
-                              </Button>
-                              {fsTypeFromPartition(part) === "apfs" && (
-                                <Button
-                                  size="xs"
-                                  variant="light"
-                                  disabled={part.is_protected}
-                                  onClick={() => openApfsManager(part)}
-                                >
-                                  Volumen verwalten
-                                </Button>
-                              )}
-                              <Button
-                                size="xs"
-                                variant="light"
-                                disabled={part.is_protected}
-                                onClick={() => openResizeWizard(part)}
-                              >
-                                Groesse
-                              <Button
-                                size="xs"
-                                variant="light"
-                                disabled={
-                                  device.is_protected ||
-                                  !clipboardPartition ||
-                                  deviceFreeBytes(device) < (clipboardPartition?.size ?? 0)
+              {selectedPartitionDevice && (
+                <>
+                  <Group justify="space-between" align="center">
+                    <div>
+                      <Text fw={700}>{selectedPartitionDevice.identifier}</Text>
+                      <Text size="sm" c="dimmed">
+                        {formatBytes(selectedPartitionDevice.size)} · {selectedPartitionDevice.internal ? "Intern" : "Extern"} · {selectedPartitionDevice.content}
+                      </Text>
+                    </div>
+                    <Group gap="xs">
+                      <Button
+                        size="xs"
+                        variant="light"
+                        onClick={() => openWipeWizard(selectedPartitionDevice)}
+                        disabled={selectedPartitionDevice.is_protected}
+                      >
+                        Geraet loeschen
+                      </Button>
+                      <Button
+                        size="xs"
+                        variant="light"
+                        disabled={selectedPartitionDevice.is_protected || deviceFreeBytes(selectedPartitionDevice) === 0}
+                        onClick={() => openCreateWizard(selectedPartitionDevice)}
+                      >
+                        Partition erstellen
+                      </Button>
+                      <Button
+                        size="xs"
+                        variant="light"
+                        disabled={
+                          selectedPartitionDevice.is_protected ||
+                          !clipboardPartition ||
+                          deviceFreeBytes(selectedPartitionDevice) < (clipboardPartition?.size ?? 0)
+                        }
+                        onClick={() => openPasteWizard(selectedPartitionDevice)}
+                      >
+                        Einfuegen
+                      </Button>
+                      <Button
+                        size="xs"
+                        variant="light"
+                        disabled={selectedPartitionDevice.is_protected}
+                        onClick={() => openTableWizard(selectedPartitionDevice)}
+                      >
+                        Partitionstabelle
+                      </Button>
+                    </Group>
+                  </Group>
+
+                  <Paper withBorder radius="lg" p="md" className="partition-bar">
+                    <div className="partition-bar__scroll" ref={partitionBarRef}>
+                      <div className="partition-bar__track">
+                        {partitionSegments.map((segment) => {
+                          const isSelected = segment.kind === "partition"
+                            ? segment.partition?.identifier === selectedPartitionId
+                            : selectedUnallocated?.offset === segment.offset;
+                          const width = (segment.size / selectedPartitionDevice.size) * 100;
+                          const label = segment.kind === "unallocated" ? formatBytes(segment.size) : segment.label;
+                          const showLabel =
+                            partitionBarWidth > 0
+                              ? (partitionBarWidth * width) / 100 >= 40
+                              : width >= 8;
+                          const isLocked = !!segment.partition?.is_protected;
+                          return (
+                            <button
+                              key={segment.key}
+                              type="button"
+                              className={
+                                [
+                                  "partition-segment",
+                                  isSelected ? "partition-segment--selected" : "",
+                                  isLocked ? "partition-segment--locked" : "",
+                                ]
+                                  .filter(Boolean)
+                                  .join(" ")
+                              }
+                              style={{ width: `${width}%`, background: fsColorForSegment(segment.fsType, segment.kind) }}
+                              title={label}
+                              onClick={() => {
+                                if (segment.kind === "partition" && segment.partition) {
+                                  setSelectedPartitionId(segment.partition.identifier);
+                                  setSelectedPartition(segment.partition);
+                                  setSelectedUnallocated(null);
+                                } else {
+                                  setSelectedPartitionId(null);
+                                  setSelectedPartition(null);
+                                  setSelectedUnallocated({ offset: segment.offset, size: segment.size });
                                 }
-                                onClick={() => openPasteWizard(device)}
-                              >
-                                Einfuegen
-                              </Button>
-                              </Button>
-                              <Button
-                                size="xs"
-                                variant="light"
-                                disabled={part.is_protected}
-                                onClick={() => openMoveWizard(part)}
-                              >
-                                Verschieben
-                              </Button>
-                              <Button
-                                size="xs"
-                                variant="light"
-                                disabled={part.is_protected}
-                                onClick={() => openCheckWizard(part)}
-                              >
-                                Ueberpruefen
-                              </Button>
-                              <Button
-                                size="xs"
-                                variant="light"
-                                disabled={part.is_protected}
-                                onClick={() => openLabelWizard(part)}
-                              >
-                                Label/UUID
-                              </Button>
-                              <Button
-                                size="xs"
-                                variant="light"
-                                disabled={part.is_protected}
-                                onClick={() => openDeleteWizard(part)}
-                              >
-                                Loeschen
-                              </Button>
-                            </Group>
-                          </Group>
-                        ))}
-                      </Stack>
-                    </Paper>
-                  ))}
-                </Stack>
+                              }}
+                            >
+                              {isLocked && <IconLock size={12} className="partition-segment__lock" />}
+                              <span className="partition-segment__label">
+                                {showLabel ? label : ""}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </Paper>
+
+                  <Group justify="space-between" align="center" mt="xs">
+                    <Text size="sm" c="dimmed">
+                      Auswahl: {selectedPartition ? `${selectedPartition.identifier} · ${selectedPartition.name || ""}`.trim() : selectedUnallocated ? "Unallocated" : "-"}
+                    </Text>
+                    <Group gap="xs">
+                      <Button
+                        size="xs"
+                        variant="light"
+                        disabled={!selectedPartition || selectedPartition.is_protected}
+                        onClick={() => selectedPartition && copyToClipboard(selectedPartition)}
+                      >
+                        Kopieren
+                      </Button>
+                      <Button
+                        size="xs"
+                        variant="light"
+                        disabled={!selectedPartition || selectedPartition.is_protected}
+                        onClick={() => selectedPartition && openFormatWizard(selectedPartition)}
+                      >
+                        Formatieren
+                      </Button>
+                      <Button
+                        size="xs"
+                        variant="light"
+                        disabled={!selectedPartition || selectedPartition.is_protected}
+                        onClick={() => selectedPartition && openResizeWizard(selectedPartition)}
+                      >
+                        Groesse
+                      </Button>
+                      <Button
+                        size="xs"
+                        variant="light"
+                        disabled={!selectedPartition || selectedPartition.is_protected}
+                        onClick={() => selectedPartition && openMoveWizard(selectedPartition)}
+                      >
+                        Verschieben
+                      </Button>
+                      <Button
+                        size="xs"
+                        variant="light"
+                        disabled={!selectedPartition || selectedPartition.is_protected}
+                        onClick={() => selectedPartition && openCheckWizard(selectedPartition)}
+                      >
+                        Ueberpruefen
+                      </Button>
+                      <Button
+                        size="xs"
+                        variant="light"
+                        disabled={!selectedPartition || selectedPartition.is_protected}
+                        onClick={() => selectedPartition && openLabelWizard(selectedPartition)}
+                      >
+                        Label/UUID
+                      </Button>
+                      {selectedPartition && fsTypeFromPartition(selectedPartition) === "apfs" && (
+                        <Button
+                          size="xs"
+                          variant="light"
+                          disabled={selectedPartition.is_protected}
+                          onClick={() => openApfsManager(selectedPartition)}
+                        >
+                          Volumen verwalten
+                        </Button>
+                      )}
+                      <Button
+                        size="xs"
+                        variant="light"
+                        color="red"
+                        disabled={!selectedPartition || selectedPartition.is_protected}
+                        onClick={() => selectedPartition && openDeleteWizard(selectedPartition)}
+                      >
+                        Loeschen
+                      </Button>
+                    </Group>
+                  </Group>
+                  {selectedPartition?.is_protected && (
+                    <Text size="xs" c="dimmed">
+                      Systempartition (SIP) erkannt. Aenderungen sind gesperrt.
+                    </Text>
+                  )}
+
+                  <Paper withBorder radius="md" p="sm" className="partition-table">
+                    <Table highlightOnHover verticalSpacing="sm">
+                      <Table.Thead>
+                        <Table.Tr>
+                          <Table.Th></Table.Th>
+                          <Table.Th>Name</Table.Th>
+                          <Table.Th>Dateisystem</Table.Th>
+                          <Table.Th>Mountpoint</Table.Th>
+                          <Table.Th>Groesse</Table.Th>
+                          <Table.Th>Flags</Table.Th>
+                        </Table.Tr>
+                      </Table.Thead>
+                      <Table.Tbody>
+                        {partitionSegments.map((segment) => {
+                          const isSelected = segment.kind === "partition"
+                            ? segment.partition?.identifier === selectedPartitionId
+                            : selectedUnallocated?.offset === segment.offset;
+                          const fsLabel = fsLabelForType(segment.fsType, segment.kind);
+                          return (
+                            <Table.Tr
+                              key={`row-${segment.key}`}
+                              data-selected={isSelected}
+                              onClick={() => {
+                                if (segment.kind === "partition" && segment.partition) {
+                                  setSelectedPartitionId(segment.partition.identifier);
+                                  setSelectedPartition(segment.partition);
+                                  setSelectedUnallocated(null);
+                                } else {
+                                  setSelectedPartitionId(null);
+                                  setSelectedPartition(null);
+                                  setSelectedUnallocated({ offset: segment.offset, size: segment.size });
+                                }
+                              }}
+                            >
+                              <Table.Td>
+                                <span
+                                  className="partition-dot"
+                                  style={{ background: fsColorForSegment(segment.fsType, segment.kind) }}
+                                />
+                              </Table.Td>
+                              <Table.Td>
+                                <Text fw={600} size="sm">
+                                  {segment.kind === "unallocated"
+                                    ? "Unallocated"
+                                    : segment.partition?.identifier}
+                                </Text>
+                                {segment.partition?.name && (
+                                  <Text size="xs" c="dimmed">
+                                    {segment.partition.name}
+                                  </Text>
+                                )}
+                              </Table.Td>
+                              <Table.Td>
+                                <Text size="sm">
+                                  {segment.kind === "unallocated" ? "-" : fsLabel}
+                                </Text>
+                              </Table.Td>
+                              <Table.Td>
+                                <Text size="sm" c="dimmed">
+                                  {segment.partition?.mount_point ?? "-"}
+                                </Text>
+                              </Table.Td>
+                              <Table.Td>
+                                <Text size="sm" className="tabular-nums">
+                                  {formatBytes(segment.size)}
+                                </Text>
+                              </Table.Td>
+                              <Table.Td>
+                                {segment.partition?.is_protected ? (
+                                  <Text size="xs" c="red">
+                                    SIP
+                                  </Text>
+                                ) : (
+                                  <Text size="xs" c="dimmed">
+                                    -
+                                  </Text>
+                                )}
+                              </Table.Td>
+                            </Table.Tr>
+                          );
+                        })}
+                      </Table.Tbody>
+                    </Table>
+                  </Paper>
+                </>
               )}
             </Paper>
           </Group>
@@ -3417,19 +3821,45 @@ export default function App() {
                   </Group>
 
                   <Stack gap="md">
-                    <Paper withBorder radius="md" p="md">
+                    <Paper withBorder radius="lg" p="md" shadow="sm" className="wizard-card">
                       <Stack gap="xs">
-                        <Text fw={600}>Quelle</Text>
-                        {imageMode === "write" ? (
+                        <Group justify="space-between" align="center">
+                          <Text fw={600}>Quelle</Text>
+                          <Badge variant="light" color="blue">
+                            {imageMode === "backup" ? "Device" : "ISO/IMG/DMG"}
+                          </Badge>
+                        </Group>
+                        {imageMode === "write" || imageMode === "windows" ? (
                           <Stack gap="xs">
-                            <Group gap="xs" align="center">
-                              <Button variant="light" onClick={chooseImageFile}>
-                                Image auswaehlen
-                              </Button>
-                              <Text size="sm" c={imagePath ? "" : "dimmed"}>
-                                {imagePath ?? "Keine Datei gewaehlt"}
-                              </Text>
-                            </Group>
+                            <Paper
+                              withBorder
+                              radius="md"
+                              p="md"
+                              className={imageDropActive ? "dropzone dropzone--active" : "dropzone"}
+                              onDragEnter={() => setImageDropActive(true)}
+                              onDragLeave={() => setImageDropActive(false)}
+                              onDragOver={(event) => {
+                                event.preventDefault();
+                                event.stopPropagation();
+                              }}
+                              onDrop={handleImageDrop}
+                              onClick={chooseImageFile}
+                            >
+                              <Group justify="space-between" align="center" wrap="nowrap">
+                                <Group gap="sm" wrap="nowrap">
+                                  <ThemeIcon size={44} radius="md" variant="light" color="blue">
+                                    <IconDeviceFloppy size={22} />
+                                  </ThemeIcon>
+                                  <div>
+                                    <Text fw={600}>{imagePath ? "Quelle erkannt" : "Drag & Drop"}</Text>
+                                    <Text size="xs" c="dimmed">
+                                      {imagePath ? truncateMiddle(imagePath, 52) : "ISO/IMG/DMG hier ablegen oder klicken"}
+                                    </Text>
+                                  </div>
+                                </Group>
+                                <Button variant="light">Auswaehlen</Button>
+                              </Group>
+                            </Paper>
                             <Group gap="xs" align="center">
                               <Button
                                 variant="subtle"
@@ -3450,7 +3880,7 @@ export default function App() {
                                 </Text>
                               )}
                             </Group>
-                            {imageWindowsDetected && (
+                            {imageMode === "write" && imageWindowsDetected && (
                               <Stack gap={4}>
                                 <Text size="sm" c="red">
                                   Achtung: Windows-ISO erkannt. Der Windows-Installer-Modus ist in Arbeit.
@@ -3467,30 +3897,23 @@ export default function App() {
                                 />
                               </Stack>
                             )}
-                          </Stack>
-                        ) : imageMode === "windows" ? (
-                          <Stack gap="xs">
-                            <Group gap="xs" align="center">
-                              <Button variant="light" onClick={chooseImageFile}>
-                                Windows-ISO auswaehlen
-                              </Button>
-                              <Text size="sm" c={imagePath ? "" : "dimmed"}>
-                                {imagePath ?? "Keine Datei gewaehlt"}
-                              </Text>
-                            </Group>
-                            {imageWindowsDetected ? (
-                              <Text size="sm" c="dimmed">
-                                Windows-ISO erkannt. Installer wird per Datei-Kopie erstellt.
-                              </Text>
-                            ) : (
-                              <Text size="sm" c="red">
-                                Keine Windows-ISO erkannt.
-                              </Text>
-                            )}
-                            {imageWindowsReason && (
-                              <Text size="xs" c="dimmed">
-                                Hinweis: {imageWindowsReason}
-                              </Text>
+                            {imageMode === "windows" && (
+                              <Stack gap={4}>
+                                {imageWindowsDetected ? (
+                                  <Text size="sm" c="dimmed">
+                                    Windows-ISO erkannt. Installer wird per Datei-Kopie erstellt.
+                                  </Text>
+                                ) : (
+                                  <Text size="sm" c="red">
+                                    Keine Windows-ISO erkannt.
+                                  </Text>
+                                )}
+                                {imageWindowsReason && (
+                                  <Text size="xs" c="dimmed">
+                                    Hinweis: {imageWindowsReason}
+                                  </Text>
+                                )}
+                              </Stack>
                             )}
                           </Stack>
                         ) : (
@@ -3501,7 +3924,7 @@ export default function App() {
                       </Stack>
                     </Paper>
 
-                    <Paper withBorder radius="md" p="md">
+                    <Paper withBorder radius="lg" p="md" shadow="sm" className="wizard-card">
                       <Stack gap="xs">
                         <Group justify="space-between" align="center">
                           <Text fw={600}>{imageMode === "write" ? "Zielgeraet" : "Quellgeraet"}</Text>
@@ -3526,7 +3949,7 @@ export default function App() {
                       </Stack>
                     </Paper>
 
-                    <Paper withBorder radius="md" p="md">
+                    <Paper withBorder radius="lg" p="md" shadow="sm" className="wizard-card">
                       <Stack gap="xs">
                         <Text fw={600}>Einstellungen</Text>
                         {imageMode === "write" ? (
@@ -3555,7 +3978,7 @@ export default function App() {
                     </Paper>
 
                     {imageMode === "backup" && (
-                      <Paper withBorder radius="md" p="md">
+                      <Paper withBorder radius="lg" p="md" shadow="sm" className="wizard-card">
                         <Stack gap="xs">
                           <Text fw={600}>Zielpfad</Text>
                           <Group gap="xs" align="center">
@@ -3577,7 +4000,7 @@ export default function App() {
                     )}
 
                     {imageMode === "windows" && (
-                      <Paper withBorder radius="md" p="md">
+                      <Paper withBorder radius="lg" p="md" shadow="sm" className="wizard-card">
                         <Stack gap="xs">
                           <Text fw={600}>Label</Text>
                           <TextInput
@@ -3593,7 +4016,7 @@ export default function App() {
                       </Paper>
                     )}
 
-                    <Paper withBorder radius="md" p="md">
+                    <Paper withBorder radius="lg" p="md" shadow="sm" className="wizard-card">
                       <Stack gap="xs">
                         <Text fw={600}>
                           {imageMode === "write" ? "Flash" : imageMode === "backup" ? "Backup" : "Windows Installer"}
@@ -3610,27 +4033,43 @@ export default function App() {
                             {imageError}
                           </Text>
                         )}
-                        <Group justify="flex-end" mt="sm">
-                          <Button
-                            color="red"
-                            onClick={submitFlashImage}
-                            loading={imageRunning}
-                            disabled={
-                              imageMode === "write"
-                                ? !imagePath || !imageTarget
-                                : imageMode === "backup"
-                                  ? !imageTarget
-                                  : !imagePath || !imageTarget || !imageWindowsDetected
-                            }
-                          >
-                            {imageMode === "write"
-                              ? "Flash starten"
-                              : imageMode === "backup"
-                                ? "Backup starten"
-                                : "Windows-Installer erstellen"}
-                          </Button>
-                        </Group>
                       </Stack>
+                    </Paper>
+
+                    <Paper withBorder radius="xl" p="md" shadow="md" className="hero-action">
+                      <Group justify="space-between" align="center" wrap="nowrap">
+                        <div>
+                          <Text fw={700} size="sm">
+                            Bereit zum Start
+                          </Text>
+                          <Text size="xs" c="dimmed">
+                            {imageMode === "write"
+                              ? "Image wird direkt auf das Ziel geschrieben."
+                              : imageMode === "backup"
+                                ? "Backup wird mit Verifikation erstellt."
+                                : "Windows-Installer erstellt den Stick per Datei-Kopie."}
+                          </Text>
+                        </div>
+                        <Button
+                          size="md"
+                          color={imageMode === "backup" ? "blue" : "red"}
+                          onClick={submitFlashImage}
+                          loading={imageRunning}
+                          disabled={
+                            imageMode === "write"
+                              ? !imagePath || !imageTarget
+                              : imageMode === "backup"
+                                ? !imageTarget
+                                : !imagePath || !imageTarget || !imageWindowsDetected
+                          }
+                        >
+                          {imageMode === "write"
+                            ? "Flash starten"
+                            : imageMode === "backup"
+                              ? "Backup starten"
+                              : "Windows-Installer erstellen"}
+                        </Button>
+                      </Group>
                     </Paper>
                   </Stack>
                 </>
@@ -3768,7 +4207,7 @@ export default function App() {
               >
                 <ResponsiveSunburst
                   data={scanData}
-                  id="name"
+                  id={(node) => (node as FileNode).path || (node as FileNode).name}
                   value="value"
                   cornerRadius={4}
                   borderWidth={1}
