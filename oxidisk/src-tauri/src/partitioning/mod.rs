@@ -105,6 +105,21 @@ pub struct CopyPartitionRequest {
     target_device: String,
 }
 
+#[derive(Deserialize)]
+pub struct PreflightRequest {
+    device_identifier: Option<String>,
+    partition_identifier: Option<String>,
+    operation: String,
+    format_type: Option<String>,
+    new_size: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ForceUnmountRequest {
+    device_identifier: Option<String>,
+    partition_identifier: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct SidecarStatus {
     name: String,
@@ -874,6 +889,77 @@ pub fn copy_partition(
         HelperRequest {
             action: "copy_partition".to_string(),
             payload,
+        },
+    )?;
+
+    ok_or_message(response)
+}
+
+#[tauri::command]
+pub fn preflight_partition(
+    app: tauri::AppHandle,
+    request: PreflightRequest,
+) -> Result<HelperResponse, String> {
+    let payload = json!({
+        "deviceIdentifier": request.device_identifier,
+        "partitionIdentifier": request.partition_identifier,
+        "operation": request.operation,
+        "formatType": request.format_type,
+        "newSize": request.new_size,
+    });
+
+    let response = run_helper(
+        &app,
+        HelperRequest {
+            action: "preflight_check".to_string(),
+            payload,
+        },
+    )?;
+
+    ok_or_message(response)
+}
+
+#[tauri::command]
+pub fn force_unmount_partition(
+    app: tauri::AppHandle,
+    request: ForceUnmountRequest,
+) -> Result<HelperResponse, String> {
+    let payload = json!({
+        "deviceIdentifier": request.device_identifier,
+        "partitionIdentifier": request.partition_identifier,
+    });
+
+    let response = run_helper(
+        &app,
+        HelperRequest {
+            action: "force_unmount".to_string(),
+            payload,
+        },
+    )?;
+
+    ok_or_message(response)
+}
+
+#[tauri::command]
+pub fn get_operation_journal(app: tauri::AppHandle) -> Result<HelperResponse, String> {
+    let response = run_helper(
+        &app,
+        HelperRequest {
+            action: "get_journal".to_string(),
+            payload: json!({}),
+        },
+    )?;
+
+    ok_or_message(response)
+}
+
+#[tauri::command]
+pub fn clear_operation_journal(app: tauri::AppHandle) -> Result<HelperResponse, String> {
+    let response = run_helper(
+        &app,
+        HelperRequest {
+            action: "clear_journal".to_string(),
+            payload: json!({}),
         },
     )?;
 

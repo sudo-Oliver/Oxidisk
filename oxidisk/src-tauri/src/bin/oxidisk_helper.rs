@@ -50,6 +50,10 @@ fn main() {
         "move_partition" => handle_move_partition(&request.payload),
         "copy_partition" => handle_copy_partition(&request.payload),
         "set_label_uuid" => handle_set_label_uuid(&request.payload),
+        "preflight_check" => handle_preflight_check(&request.payload),
+        "force_unmount" => handle_force_unmount(&request.payload),
+        "get_journal" => handle_get_journal(),
+        "clear_journal" => handle_clear_journal(),
         _ => Err("Unknown action".to_string()),
     };
 
@@ -73,7 +77,9 @@ fn handle_wipe_device(payload: &Value) -> Result<Option<Value>, String> {
 
     let device = normalize_device(&device_identifier);
 
-    match format_type.to_lowercase().as_str() {
+    force_unmount_disk(&device)?;
+
+    let result = match format_type.to_lowercase().as_str() {
         "exfat" => {
             run_diskutil(["eraseDisk", "ExFAT", &label, scheme, &device])?;
             Ok(Some(json!({ "device": device, "format": "ExFAT", "scheme": scheme })))
@@ -93,7 +99,12 @@ fn handle_wipe_device(payload: &Value) -> Result<Option<Value>, String> {
         "f2fs" => wipe_linux_device(&device, scheme, "f2fs", &label),
         "swap" => wipe_linux_device(&device, scheme, "swap", &label),
         other => Err(format!("Unsupported format type: {other}")),
+    };
+
+    if result.is_ok() {
+        sync_kernel_table(&device);
     }
+    result
 }
 
 fn handle_create_partition_table(payload: &Value) -> Result<Option<Value>, String> {
@@ -108,6 +119,7 @@ fn handle_create_partition_table(payload: &Value) -> Result<Option<Value>, Strin
 
     let device = normalize_device(&device_identifier);
 
+    force_unmount_disk(&device)?;
     run_diskutil([
         "partitionDisk",
         &device,
@@ -117,6 +129,8 @@ fn handle_create_partition_table(payload: &Value) -> Result<Option<Value>, Strin
         "%noformat%",
         "100%",
     ])?;
+
+    sync_kernel_table(&device);
 
     Ok(Some(json!({ "device": device, "scheme": scheme })))
 }
@@ -129,7 +143,9 @@ fn handle_create_partition(payload: &Value) -> Result<Option<Value>, String> {
 
     let device = normalize_device(&device_identifier);
 
-    match format_type.to_lowercase().as_str() {
+    force_unmount_disk(&device)?;
+
+    let result = match format_type.to_lowercase().as_str() {
         "exfat" => {
             run_diskutil(["addPartition", &device, "ExFAT", &label, &size])?;
             Ok(Some(json!({ "device": device, "format": "ExFAT", "size": size })))
@@ -145,14 +161,24 @@ fn handle_create_partition(payload: &Value) -> Result<Option<Value>, String> {
         "f2fs" => create_linux_partition(&device, "f2fs", &label, &size),
         "swap" => create_linux_partition(&device, "swap", &label, &size),
         other => Err(format!("Unsupported format type: {other}")),
+    };
+
+    if result.is_ok() {
+        sync_kernel_table(&device);
     }
+    result
 }
 
 fn handle_delete_partition(payload: &Value) -> Result<Option<Value>, String> {
     let partition_identifier = read_string(payload, "partitionIdentifier")?;
     let device = normalize_device(&partition_identifier);
 
+    maybe_swapoff(&device)?;
+    force_unmount_disk(&device)?;
+
     run_diskutil(["eraseVolume", "free", "none", &device])?;
+
+    sync_kernel_table(&device);
 
     Ok(Some(json!({ "partition": device })))
 }
@@ -164,9 +190,10 @@ fn handle_format_partition(payload: &Value) -> Result<Option<Value>, String> {
 
     let device = normalize_device(&partition_identifier);
 
-    run_diskutil(["unmount", "force", &device])?;
+    maybe_swapoff(&device)?;
+    force_unmount_disk(&device)?;
 
-    match format_type.to_lowercase().as_str() {
+    let result = match format_type.to_lowercase().as_str() {
         "exfat" => {
             run_diskutil(["eraseVolume", "ExFAT", &label, &device])?;
             Ok(Some(json!({ "device": device, "format": "ExFAT" })))
@@ -186,7 +213,12 @@ fn handle_format_partition(payload: &Value) -> Result<Option<Value>, String> {
         "f2fs" => format_linux_partition(&device, "f2fs", &label),
         "swap" => format_linux_partition(&device, "swap", &label),
         other => Err(format!("Unsupported format type: {other}")),
+    };
+
+    if result.is_ok() {
+        sync_kernel_table(&device);
     }
+    result
 }
 
 fn handle_set_label_uuid(payload: &Value) -> Result<Option<Value>, String> {
@@ -246,7 +278,175 @@ fn handle_set_label_uuid(payload: &Value) -> Result<Option<Value>, String> {
         _ => return Err("Unsupported filesystem for label/UUID".to_string()),
     }
 
+    sync_kernel_table(&device);
+
     Ok(Some(json!({ "device": device, "label": label, "uuid": uuid, "fs": fs_type })))
+}
+
+fn handle_preflight_check(payload: &Value) -> Result<Option<Value>, String> {
+    let operation = payload
+        .get("operation")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let device_identifier = payload
+        .get("partitionIdentifier")
+        .and_then(|value| value.as_str())
+        .or_else(|| payload.get("deviceIdentifier").and_then(|value| value.as_str()))
+        .ok_or_else(|| "Missing device identifier".to_string())?;
+    let format_type = payload
+        .get("formatType")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_lowercase());
+    let new_size = payload
+        .get("newSize")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+
+    let device = normalize_device(device_identifier);
+    let fs_type = match &format_type {
+        Some(fs) => fs.clone(),
+        None => detect_fs_type(&device).unwrap_or_else(|_| "unknown".to_string()),
+    };
+
+    let mut blockers: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    let battery = read_battery_status();
+    if let Some(info) = &battery {
+        if info.is_laptop && !info.on_ac {
+            if let Some(percent) = info.percent {
+                if percent < 30 {
+                    blockers.push("Bitte Netzteil anschliessen (Akkustand zu niedrig).".to_string());
+                }
+            }
+        }
+    }
+
+    let sidecars = required_sidecars(&operation, &fs_type);
+    for sidecar in &sidecars {
+        if !sidecar.found {
+            blockers.push(format!("Sidecar fehlt: {}", sidecar.name));
+        }
+    }
+
+    let mut busy_processes: Vec<Value> = Vec::new();
+    if let Ok(Some(mount_point)) = read_mount_point(&device) {
+        match list_open_processes(&mount_point) {
+            Ok(processes) => {
+                if !processes.is_empty() {
+                    blockers.push("Volume ist noch in Benutzung.".to_string());
+                }
+                for proc_info in processes {
+                    busy_processes.push(json!({
+                        "pid": proc_info.pid,
+                        "command": proc_info.command,
+                    }));
+                }
+            }
+            Err(err) => warnings.push(format!("lsof fehlgeschlagen: {err}")),
+        }
+    }
+
+    let fs_check = if matches!(operation.as_str(), "resize" | "move") {
+        run_quick_fs_check(&device, &fs_type).ok()
+    } else {
+        None
+    };
+    if let Some(check) = &fs_check {
+        if !check.ok {
+            warnings.push("Dateisystem-Pruefung meldet Fehler. Reparatur empfohlen.".to_string());
+        }
+    }
+
+    if let Some(size) = &new_size {
+        if let Ok(new_bytes) = parse_size_bytes(size) {
+            if let Some(used_bytes) = volume_used_bytes(&device) {
+                let min_bytes = ((used_bytes as f64) * 1.05).ceil() as u64;
+                if new_bytes < min_bytes {
+                    blockers.push("Zielgroesse ist kleiner als belegter Speicher (mit Puffer).".to_string());
+                }
+            }
+        }
+    }
+
+    if is_boot_volume(&device) {
+        warnings.push("Achtung: Partition gehoert zu einer macOS-Installation.".to_string());
+    }
+
+    let ok = blockers.is_empty();
+    Ok(Some(json!({
+        "ok": ok,
+        "operation": operation,
+        "device": device,
+        "fs": fs_type,
+        "blockers": blockers,
+        "warnings": warnings,
+        "busyProcesses": busy_processes,
+        "battery": battery.map(|info| json!({
+            "isLaptop": info.is_laptop,
+            "onAc": info.on_ac,
+            "percent": info.percent,
+        })),
+        "sidecars": sidecars.into_iter().map(|item| json!({
+            "name": item.name,
+            "found": item.found,
+            "path": item.path,
+        })).collect::<Vec<Value>>(),
+        "fsCheck": fs_check.map(|check| json!({
+            "ok": check.ok,
+            "output": check.output,
+        })),
+    })))
+}
+
+fn handle_force_unmount(payload: &Value) -> Result<Option<Value>, String> {
+    let device_identifier = payload
+        .get("partitionIdentifier")
+        .and_then(|value| value.as_str())
+        .or_else(|| payload.get("deviceIdentifier").and_then(|value| value.as_str()))
+        .ok_or_else(|| "Missing device identifier".to_string())?;
+    let device = normalize_device(device_identifier);
+
+    let mut killed: Vec<Value> = Vec::new();
+    if let Ok(Some(mount_point)) = read_mount_point(&device) {
+        if let Ok(processes) = list_open_processes(&mount_point) {
+            for proc_info in processes {
+                let _ = Command::new("kill")
+                    .args(["-TERM", &proc_info.pid.to_string()])
+                    .output();
+                killed.push(json!({
+                    "pid": proc_info.pid,
+                    "command": proc_info.command,
+                }));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            for proc_info in &killed {
+                if let Some(pid) = proc_info.get("pid").and_then(|v| v.as_i64()) {
+                    let _ = Command::new("kill").args(["-KILL", &pid.to_string()]).output();
+                }
+            }
+        }
+    }
+
+    force_unmount_disk(&device)?;
+
+    Ok(Some(json!({ "device": device, "killed": killed })))
+}
+
+fn handle_get_journal() -> Result<Option<Value>, String> {
+    let path = journal_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = std::fs::read_to_string(&path).map_err(|e| format!("Journal read failed: {e}"))?;
+    let value: Value = serde_json::from_str(&data).map_err(|e| format!("Journal parse failed: {e}"))?;
+    Ok(Some(value))
+}
+
+fn handle_clear_journal() -> Result<Option<Value>, String> {
+    clear_journal();
+    Ok(Some(json!({ "cleared": true })))
 }
 
 fn handle_check_partition(payload: &Value) -> Result<Option<Value>, String> {
@@ -279,9 +479,12 @@ fn handle_resize_partition(payload: &Value) -> Result<Option<Value>, String> {
     let new_size = read_string(payload, "newSize")?;
     let device = normalize_device(&partition_identifier);
 
+    maybe_swapoff(&device)?;
+    force_unmount_disk(&device)?;
+
     let fs_type = detect_fs_type(&device)?;
     emit_progress("resize", 0, 100, Some("Start resize"));
-    match fs_type.as_str() {
+    let result = match fs_type.as_str() {
         "apfs" | "hfs+" => {
             run_diskutil(["resizeVolume", &device, &new_size])?;
             emit_progress("resize", 100, 100, Some("Resize complete"));
@@ -291,7 +494,12 @@ fn handle_resize_partition(payload: &Value) -> Result<Option<Value>, String> {
         "ext4" => resize_linux_partition(&device, "ext4", &new_size),
         "ntfs" => resize_linux_partition(&device, "ntfs", &new_size),
         _ => Err("Unsupported filesystem for resize".to_string()),
+    };
+
+    if result.is_ok() {
+        sync_kernel_table(&device);
     }
+    result
 }
 
 fn handle_move_partition(payload: &Value) -> Result<Option<Value>, String> {
@@ -299,10 +507,14 @@ fn handle_move_partition(payload: &Value) -> Result<Option<Value>, String> {
     let new_start = read_string(payload, "newStart")?;
     let device = normalize_device(&partition_identifier);
 
+    maybe_swapoff(&device)?;
+    force_unmount_disk(&device)?;
+
     let target_start = parse_size_bytes(&new_start)?;
     emit_progress("move", 0, 100, Some("Start move"));
     let result = move_partition(&device, target_start)?;
     emit_progress("move", 100, 100, Some("Move complete"));
+    sync_kernel_table(&device);
     Ok(result)
 }
 
@@ -318,6 +530,10 @@ fn handle_copy_partition(payload: &Value) -> Result<Option<Value>, String> {
         "ext4" | "ntfs" | "exfat" | "fat32" => {}
         _ => return Err("Copy not supported for this filesystem".to_string()),
     }
+
+    maybe_swapoff(&source_device)?;
+    force_unmount_disk(&source_device)?;
+    force_unmount_disk(&target_disk)?;
 
     emit_progress("copy", 0, 100, Some("Prepare target"));
 
@@ -363,6 +579,7 @@ fn handle_copy_partition(payload: &Value) -> Result<Option<Value>, String> {
     }
 
     emit_progress("copy", 100, 100, Some("Copy complete"));
+    sync_kernel_table(&target_partition);
     Ok(Some(json!({
         "source": source_device,
         "target": target_partition,
@@ -378,6 +595,269 @@ fn read_string(payload: &Value, key: &str) -> Result<String, String> {
         .and_then(|value| value.as_str())
         .map(|value| value.to_string())
         .ok_or_else(|| format!("Missing field: {key}"))
+}
+
+struct BatteryStatus {
+    is_laptop: bool,
+    on_ac: bool,
+    percent: Option<u32>,
+}
+
+struct SidecarCheck {
+    name: String,
+    found: bool,
+    path: Option<String>,
+}
+
+struct FsCheckResult {
+    ok: bool,
+    output: String,
+}
+
+struct ProcessInfo {
+    pid: i32,
+    command: String,
+}
+
+fn read_battery_status() -> Option<BatteryStatus> {
+    let output = Command::new("pmset").args(["-g", "batt"]).output().ok()?;
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    if text.to_lowercase().contains("no batteries") {
+        return Some(BatteryStatus {
+            is_laptop: false,
+            on_ac: true,
+            percent: None,
+        });
+    }
+
+    let on_ac = text.contains("AC Power");
+    let percent = text
+        .split('%')
+        .next()
+        .and_then(|part| part.split_whitespace().last())
+        .and_then(|digits| digits.parse::<u32>().ok());
+
+    Some(BatteryStatus {
+        is_laptop: true,
+        on_ac,
+        percent,
+    })
+}
+
+fn read_mount_point(device: &str) -> Result<Option<String>, String> {
+    let output = Command::new("diskutil")
+        .args(["info", "-plist", device])
+        .output()
+        .map_err(|e| format!("diskutil failed: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("diskutil error: {stderr}"));
+    }
+    let plist = PlistValue::from_reader_xml(&output.stdout[..]).map_err(|e| e.to_string())?;
+    let dict = plist
+        .as_dictionary()
+        .ok_or_else(|| "Invalid plist".to_string())?;
+    Ok(dict
+        .get("MountPoint")
+        .and_then(|v| v.as_string())
+        .map(|s| s.to_string()))
+}
+
+fn list_open_processes(mount_point: &str) -> Result<Vec<ProcessInfo>, String> {
+    let output = Command::new("lsof")
+        .args(["-Fpcn", "-f", "--", mount_point])
+        .output()
+        .map_err(|e| format!("lsof failed: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("lsof error: {stderr}"));
+    }
+
+    let mut processes: Vec<ProcessInfo> = Vec::new();
+    let mut current_pid: Option<i32> = None;
+    let mut current_cmd: Option<String> = None;
+    let mut seen = std::collections::HashSet::new();
+
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(rest) = line.strip_prefix('p') {
+            current_pid = rest.parse::<i32>().ok();
+        } else if let Some(rest) = line.strip_prefix('c') {
+            current_cmd = Some(rest.to_string());
+        }
+
+        if let (Some(pid), Some(cmd)) = (current_pid, current_cmd.clone()) {
+            if seen.insert(pid) {
+                processes.push(ProcessInfo { pid, command: cmd });
+            }
+            current_pid = None;
+            current_cmd = None;
+        }
+    }
+
+    Ok(processes)
+}
+
+fn required_sidecars(operation: &str, fs_type: &str) -> Vec<SidecarCheck> {
+    let mut names: Vec<String> = Vec::new();
+    if matches!(operation, "wipe" | "create" | "format") {
+        if let Some(bin) = mkfs_binary_for(fs_type) {
+            names.push(bin.to_string());
+        }
+    }
+    if matches!(operation, "resize") {
+        if fs_type == "ext4" {
+            names.push("sgdisk".to_string());
+            names.push("resize2fs".to_string());
+        } else if fs_type == "ntfs" {
+            names.push("sgdisk".to_string());
+            names.push("ntfsresize".to_string());
+        }
+    }
+    if matches!(operation, "move") {
+        names.push("sgdisk".to_string());
+    }
+
+    names
+        .into_iter()
+        .map(|name| {
+            let path = find_sidecar(&name).ok();
+            SidecarCheck {
+                name: name.clone(),
+                found: path.is_some(),
+                path: path.map(|p| p.display().to_string()),
+            }
+        })
+        .collect()
+}
+
+fn mkfs_binary_for(fs_type: &str) -> Option<&'static str> {
+    match fs_type {
+        "ext4" => Some("mkfs.ext4"),
+        "ntfs" => Some("mkfs.ntfs"),
+        "btrfs" => Some("mkfs.btrfs"),
+        "xfs" => Some("mkfs.xfs"),
+        "f2fs" => Some("mkfs.f2fs"),
+        "swap" => Some("mkswap"),
+        _ => None,
+    }
+}
+
+fn run_quick_fs_check(device: &str, fs_type: &str) -> Result<FsCheckResult, String> {
+    let output = match fs_type {
+        "ext4" => run_sidecar_capture("e2fsck", ["-n", "-f", device])?,
+        "ntfs" => run_sidecar_capture("ntfsfix", ["-n", device])?,
+        "apfs" | "exfat" | "fat32" => run_diskutil_capture(["verifyVolume", device])?,
+        _ => return Err("Unsupported filesystem for preflight check".to_string()),
+    };
+    Ok(FsCheckResult { ok: true, output })
+}
+
+fn volume_used_bytes(device: &str) -> Option<u64> {
+    let output = Command::new("diskutil")
+        .args(["info", "-plist", device])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let plist = PlistValue::from_reader_xml(&output.stdout[..]).ok()?;
+    let dict = plist.as_dictionary()?;
+    dict.get("VolumeUsedSpace")
+        .and_then(|v| v.as_unsigned_integer())
+        .or_else(|| dict.get("UsedSpace").and_then(|v| v.as_unsigned_integer()))
+        .or_else(|| dict.get("VolumeAllocatedSpace").and_then(|v| v.as_unsigned_integer()))
+}
+
+fn is_boot_volume(device: &str) -> bool {
+    let output = Command::new("diskutil")
+        .args(["info", "-plist", device])
+        .output();
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+    let plist = match PlistValue::from_reader_xml(&output.stdout[..]) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let dict = match plist.as_dictionary() {
+        Some(d) => d,
+        None => return false,
+    };
+    if let Some(PlistValue::Array(roles)) = dict.get("APFSVolumeRoles") {
+        for role in roles {
+            if let Some(role_name) = role.as_string() {
+                if role_name == "System" || role_name == "Data" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn force_unmount_disk(device: &str) -> Result<(), String> {
+    let disk = parent_disk_identifier(device).unwrap_or_else(|| device.to_string());
+    let _ = run_diskutil(["unmount", "force", device]);
+    run_diskutil(["unmountDisk", "force", &disk])?;
+    Ok(())
+}
+
+fn sync_kernel_table(device: &str) {
+    let disk = parent_disk_identifier(device).unwrap_or_else(|| device.to_string());
+    let _ = run_diskutil(["quiet", "repairDisk", &disk]);
+    let _ = run_diskutil(["updateDefaultPartitionOrder", &disk]);
+}
+
+fn maybe_swapoff(device: &str) -> Result<(), String> {
+    let fs_type = detect_fs_type(device).unwrap_or_else(|_| "unknown".to_string());
+    if fs_type != "swap" {
+        return Ok(());
+    }
+
+    if Command::new("swapoff").args(["-a"]).output().is_ok() {
+        return Ok(());
+    }
+    if let Ok(path) = find_sidecar("swapoff") {
+        Command::new(&path)
+            .args(["-a"])
+            .output()
+            .map_err(|e| format!("swapoff failed: {e}"))?;
+        return Ok(());
+    }
+
+    Err("swapoff not available".to_string())
+}
+
+fn journal_path() -> PathBuf {
+    PathBuf::from("/Library/Application Support/com.oliverquick.oxidisk/operation_journal.json")
+}
+
+fn write_journal(value: &Value) -> Result<(), String> {
+    let path = journal_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("Journal mkdir failed: {e}"))?;
+    }
+    let data = serde_json::to_string_pretty(value).map_err(|e| format!("Journal encode failed: {e}"))?;
+    std::fs::write(&path, data).map_err(|e| format!("Journal write failed: {e}"))?;
+    Ok(())
+}
+
+fn update_journal_progress(copied: u64) -> Result<(), String> {
+    let path = journal_path();
+    if !path.exists() {
+        return Ok(());
+    }
+    let data = std::fs::read_to_string(&path).map_err(|e| format!("Journal read failed: {e}"))?;
+    let mut value: Value = serde_json::from_str(&data).map_err(|e| format!("Journal parse failed: {e}"))?;
+    value["lastCopied"] = json!(copied);
+    value["updatedAt"] = json!(current_timestamp());
+    write_journal(&value)
+}
+
+fn clear_journal() {
+    let path = journal_path();
+    let _ = std::fs::remove_file(path);
 }
 
 fn normalize_device(identifier: &str) -> String {
@@ -760,8 +1240,20 @@ fn move_partition(device: &str, new_start: u64) -> Result<Option<Value>, String>
         return Err("Move would overlap existing data".to_string());
     }
 
-    run_diskutil(["unmount", "force", device])?;
-    let move_log = copy_blocks(&info.disk, old_start, aligned_start, size)?;
+    let journal = json!({
+        "operation": "move",
+        "device": info.device,
+        "disk": info.disk,
+        "srcOffset": old_start,
+        "dstOffset": aligned_start,
+        "size": size,
+        "blockSize": info.block_size,
+        "lastCopied": 0,
+        "updatedAt": current_timestamp(),
+    });
+    write_journal(&journal)?;
+
+    let move_log = copy_blocks(&info.disk, old_start, aligned_start, size, true)?;
 
     let start_sector = aligned_start / info.block_size;
     let end_sector = (new_end / info.block_size) - 1;
@@ -777,10 +1269,11 @@ fn move_partition(device: &str, new_start: u64) -> Result<Option<Value>, String>
         ],
     )?;
 
+    clear_journal();
     Ok(Some(json!({ "device": device, "newStart": aligned_start, "output": format!("{move_log}\n{gpt_log}").trim() })))
 }
 
-fn copy_blocks(disk: &str, src_offset: u64, dst_offset: u64, size: u64) -> Result<String, String> {
+fn copy_blocks(disk: &str, src_offset: u64, dst_offset: u64, size: u64, journal: bool) -> Result<String, String> {
     let mut reader = std::fs::OpenOptions::new()
         .read(true)
         .open(disk)
@@ -814,6 +1307,9 @@ fn copy_blocks(disk: &str, src_offset: u64, dst_offset: u64, size: u64) -> Resul
             if copied >= next_progress {
                 let percent = ((copied as f64 / size as f64) * 100.0).round() as u64;
                 emit_progress_bytes("move", percent, 100, Some("Copying blocks"), copied, size);
+                if journal {
+                    let _ = update_journal_progress(copied);
+                }
                 next_progress += progress_step;
             }
         }
@@ -833,6 +1329,9 @@ fn copy_blocks(disk: &str, src_offset: u64, dst_offset: u64, size: u64) -> Resul
             if copied >= next_progress {
                 let percent = ((copied as f64 / size as f64) * 100.0).round() as u64;
                 emit_progress_bytes("move", percent, 100, Some("Copying blocks"), copied, size);
+                if journal {
+                    let _ = update_journal_progress(copied);
+                }
                 next_progress += progress_step;
             }
         }
@@ -851,6 +1350,7 @@ fn copy_partition_blocks(source_device: &str, target_device: &str, size: u64) ->
             source_info.partition_offset,
             target_info.partition_offset,
             size,
+            false,
         );
     }
 

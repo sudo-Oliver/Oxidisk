@@ -366,6 +366,10 @@ fn main() {
             partitioning::resize_partition,
             partitioning::move_partition,
             partitioning::copy_partition,
+            partitioning::preflight_partition,
+            partitioning::force_unmount_partition,
+            partitioning::get_operation_journal,
+            partitioning::clear_operation_journal,
             partitioning::get_sidecar_status,
             partitioning::get_partition_bounds,
         ])

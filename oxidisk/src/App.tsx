@@ -25,6 +25,12 @@ import {
   ActionIcon,
   Modal,
   Divider,
+          {selectedPartition &&
+            renderPreflightBlock({
+              operation: "format",
+              partitionIdentifier: selectedPartition.identifier,
+              formatType: formatType,
+            })}
   NativeSelect,
   TextInput,
   Tooltip,
@@ -34,7 +40,17 @@ import {
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import {
-  IconDatabase,
+            <Button
+              onClick={submitFormatWizard}
+              loading={formatSubmitting}
+              disabled={!preflightReady(
+                preflightKeyFor({
+                  operation: "format",
+                  device: selectedPartition?.identifier ?? "",
+                  formatType: formatType,
+                })
+              )}
+            >
   IconChartPie,
   IconSettings,
   IconRefresh,
@@ -89,6 +105,48 @@ interface PartitionDevice {
   protection_reason?: string | null;
 }
 
+interface PreflightBattery {
+  isLaptop: boolean;
+  onAc: boolean;
+  percent?: number | null;
+}
+
+interface PreflightSidecar {
+  name: string;
+  found: boolean;
+  path?: string | null;
+}
+
+interface PreflightProcess {
+  pid: number;
+  command: string;
+}
+
+interface PreflightResult {
+  ok: boolean;
+  operation?: string;
+  device?: string;
+  fs?: string;
+  blockers: string[];
+  warnings: string[];
+  busyProcesses: PreflightProcess[];
+  battery?: PreflightBattery | null;
+  sidecars?: PreflightSidecar[];
+  fsCheck?: { ok: boolean; output?: string } | null;
+}
+
+interface OperationJournal {
+  operation: string;
+  device: string;
+  disk: string;
+  srcOffset?: number;
+  dstOffset?: number;
+  size?: number;
+  blockSize?: number;
+  lastCopied?: number;
+  updatedAt?: number;
+}
+
 const CHART_COLORS = ["#0A84FF", "#5E5CE6", "#64D2FF", "#30D158", "#40CBE0", "#7DDBEE"];
 
 // --- HELPER ---
@@ -114,6 +172,12 @@ export default function App() {
   const [showSystemVolumes, setShowSystemVolumes] = useState(false);
   const [partitionDevices, setPartitionDevices] = useState<PartitionDevice[]>([]);
   const [partitionLoading, setPartitionLoading] = useState(false);
+  const [preflightResult, setPreflightResult] = useState<PreflightResult | null>(null);
+  const [preflightKey, setPreflightKey] = useState<string | null>(null);
+  const [preflightRunning, setPreflightRunning] = useState(false);
+  const [preflightError, setPreflightError] = useState<string | null>(null);
+  const [journalInfo, setJournalInfo] = useState<OperationJournal | null>(null);
+  const [journalOpen, setJournalOpen] = useState(false);
   const [wipeWizardOpen, setWipeWizardOpen] = useState(false);
   const [selectedWipeDevice, setSelectedWipeDevice] = useState<PartitionDevice | null>(null);
   const [wipeConfirmText, setWipeConfirmText] = useState("");
@@ -245,7 +309,13 @@ export default function App() {
     setWipeFormatType("exfat");
     setWipeError(null);
     setWipeSuccess(null);
+    resetPreflight();
     setWipeWizardOpen(true);
+    runPreflight({
+      operation: "wipe",
+      deviceIdentifier: device.identifier,
+      formatType: "exfat",
+    });
   }
 
   function supportsAutoMount(formatType: string) {
@@ -254,6 +324,103 @@ export default function App() {
 
   function isMacMountable(formatType: string) {
     return ["exfat", "fat32", "apfs", "hfs+"].includes(formatType.toLowerCase());
+  }
+
+  function isExoticFs(formatType: string) {
+    return ["btrfs", "xfs", "f2fs", "nilfs2", "swap"].includes(formatType.toLowerCase());
+  }
+
+  function preflightKeyFor(params: {
+    operation: string;
+    device?: string | null;
+    formatType?: string | null;
+    newSize?: string | null;
+  }) {
+    return [params.operation, params.device ?? "", params.formatType ?? "", params.newSize ?? ""].join("|");
+  }
+
+  function resetPreflight() {
+    setPreflightResult(null);
+    setPreflightKey(null);
+    setPreflightError(null);
+  }
+
+  function preflightReady(key: string) {
+    return !!preflightResult?.ok && preflightKey === key;
+  }
+
+  async function runPreflight(params: {
+    operation: string;
+    deviceIdentifier?: string;
+    partitionIdentifier?: string;
+    formatType?: string;
+    newSize?: string;
+  }) {
+    const key = preflightKeyFor({
+      operation: params.operation,
+      device: params.partitionIdentifier ?? params.deviceIdentifier ?? "",
+      formatType: params.formatType ?? "",
+      newSize: params.newSize ?? "",
+    });
+    setPreflightRunning(true);
+    setPreflightError(null);
+    try {
+      const result = await invoke<{ details?: PreflightResult }>("preflight_partition", params);
+      setPreflightResult(result.details ?? null);
+      setPreflightKey(key);
+    } catch (error) {
+      setPreflightError(String(error));
+      setPreflightResult(null);
+      setPreflightKey(null);
+    } finally {
+      setPreflightRunning(false);
+    }
+  }
+
+  async function forceUnmount(params: { deviceIdentifier?: string; partitionIdentifier?: string }) {
+    try {
+      await invoke("force_unmount_partition", params);
+    } catch (error) {
+      setPreflightError(String(error));
+    }
+  }
+
+  async function loadOperationJournal() {
+    try {
+      const result = await invoke<{ details?: OperationJournal }>("get_operation_journal");
+      if (result.details) {
+        setJournalInfo(result.details);
+        setJournalOpen(true);
+      }
+    } catch (error) {
+      console.error(error);
+    }
+  }
+
+  async function clearOperationJournal() {
+    try {
+      await invoke("clear_operation_journal");
+    } catch (error) {
+      console.error(error);
+    }
+  }
+
+  async function handleJournalRepair() {
+    if (!journalInfo?.device) return;
+    try {
+      const result = await invoke<{ details?: { output?: string } }>("check_partition", {
+        partitionIdentifier: journalInfo.device,
+        repair: true,
+      });
+      const output = result?.details?.output ?? "Repair abgeschlossen.";
+      setCheckOutput(output);
+    } catch (error) {
+      setCheckOutput(String(error));
+    } finally {
+      await clearOperationJournal();
+      setJournalOpen(false);
+      setJournalInfo(null);
+    }
   }
 
   function fsTypeFromPartition(partition: PartitionEntry | null) {
@@ -299,7 +466,13 @@ export default function App() {
     setCreateSizeValue(initial);
     setCreateError(null);
     setCreateSuccess(null);
+    resetPreflight();
     setCreateWizardOpen(true);
+    runPreflight({
+      operation: "create",
+      deviceIdentifier: device.identifier,
+      formatType: "exfat",
+    });
   }
 
   function labelMaxLength(formatType: string) {
@@ -348,6 +521,15 @@ export default function App() {
 
   async function submitCreateWizard() {
     if (!createDevice) return;
+    const preflightKey = preflightKeyFor({
+      operation: "create",
+      device: createDevice.identifier,
+      formatType: createFormatType,
+    });
+    if (!preflightReady(preflightKey)) {
+      setCreateError("Bitte Safety-Preflight ausfuehren.");
+      return;
+    }
     const validation = validateCreateInputs();
     if (validation) {
       setCreateError(validation);
@@ -434,10 +616,17 @@ export default function App() {
   function openResizeWizard(partition: PartitionEntry) {
     setResizePartition(partition);
     setResizeUnit("gb");
-    setResizeValue(Math.max(1, Math.round((partition.size / (1024 * 1024 * 1024)) * 10) / 10));
+    const initial = Math.max(1, Math.round((partition.size / (1024 * 1024 * 1024)) * 10) / 10);
+    setResizeValue(initial);
     setResizeError(null);
     setResizeSuccess(null);
+    resetPreflight();
     setResizeWizardOpen(true);
+    runPreflight({
+      operation: "resize",
+      partitionIdentifier: partition.identifier,
+      newSize: `${initial}g`,
+    });
   }
 
   function resizeSizeString() {
@@ -457,6 +646,15 @@ export default function App() {
 
   async function submitResizeWizard() {
     if (!resizePartition) return;
+    const preflightKey = preflightKeyFor({
+      operation: "resize",
+      device: resizePartition.identifier,
+      newSize: resizeSizeString(),
+    });
+    if (!preflightReady(preflightKey)) {
+      setResizeError("Bitte Safety-Preflight ausfuehren.");
+      return;
+    }
     if (!resizeValue || resizeValue <= 0) {
       setResizeError("Bitte eine Groesse angeben.");
       return;
@@ -500,9 +698,14 @@ export default function App() {
     setMoveError(null);
     setMoveSuccess(null);
     setMoveBounds(null);
+    resetPreflight();
     setMoveWizardOpen(true);
     loadMoveBounds(partition.identifier).catch(() => {
       setMoveBounds(null);
+    });
+    runPreflight({
+      operation: "move",
+      partitionIdentifier: partition.identifier,
     });
   }
 
@@ -518,6 +721,11 @@ export default function App() {
       });
       const defaultMb = Math.round(result.offset / (1024 * 1024));
       setMoveStartValue(defaultMb);
+      runPreflight({
+        operation: "move",
+        partitionIdentifier: identifier,
+        newSize: `${defaultMb}m`,
+      });
     } catch (error) {
       setMoveError(String(error));
     }
@@ -531,6 +739,15 @@ export default function App() {
 
   async function submitMoveWizard() {
     if (!movePartition) return;
+    const preflightKey = preflightKeyFor({
+      operation: "move",
+      device: movePartition.identifier,
+      newSize: moveStartString(),
+    });
+    if (!preflightReady(preflightKey)) {
+      setMoveError("Bitte Safety-Preflight ausfuehren.");
+      return;
+    }
     if (!moveStartValue || moveStartValue < 0) {
       setMoveError("Bitte einen Startwert angeben.");
       return;
@@ -676,7 +893,13 @@ export default function App() {
     setFormatLabel(partition.name || "OXIDISK");
     setFormatError(null);
     setFormatSuccess(null);
+    resetPreflight();
     setFormatWizardOpen(true);
+    runPreflight({
+      operation: "format",
+      partitionIdentifier: partition.identifier,
+      formatType: "exfat",
+    });
   }
 
   function validateFormatInputs() {
@@ -693,6 +916,15 @@ export default function App() {
 
   async function submitFormatWizard() {
     if (!selectedPartition) return;
+    const preflightKey = preflightKeyFor({
+      operation: "format",
+      device: selectedPartition.identifier,
+      formatType: formatType,
+    });
+    if (!preflightReady(preflightKey)) {
+      setFormatError("Bitte Safety-Preflight ausfuehren.");
+      return;
+    }
     const validation = validateFormatInputs();
     if (validation) {
       setFormatError(validation);
@@ -806,6 +1038,15 @@ export default function App() {
 
   async function submitWipeWizard() {
     if (!selectedWipeDevice) return;
+    const preflightKey = preflightKeyFor({
+      operation: "wipe",
+      device: selectedWipeDevice.identifier,
+      formatType: wipeFormatType,
+    });
+    if (!preflightReady(preflightKey)) {
+      setWipeError("Bitte Safety-Preflight ausfuehren.");
+      return;
+    }
     if (wipeConfirmText.trim() !== selectedWipeDevice.identifier) {
       setWipeError("Bitte die Device-ID exakt eingeben.");
       return;
@@ -940,6 +1181,7 @@ export default function App() {
   useEffect(() => {
     if (activeView === "partition") {
       loadPartitionDevices();
+      loadOperationJournal();
     }
   }, [activeView]);
 
@@ -1013,6 +1255,99 @@ export default function App() {
 
   const usagePercentLabel = `${Math.round(usagePercent)}%`;
 
+  function renderPreflightBlock(params: {
+    operation: string;
+    deviceIdentifier?: string;
+    partitionIdentifier?: string;
+    formatType?: string;
+    newSize?: string;
+  }) {
+    const key = preflightKeyFor({
+      operation: params.operation,
+      device: params.partitionIdentifier ?? params.deviceIdentifier ?? "",
+      formatType: params.formatType ?? "",
+      newSize: params.newSize ?? "",
+    });
+    const result = preflightKey === key ? preflightResult : null;
+    const blockers = result?.blockers ?? [];
+    const warnings = result?.warnings ?? [];
+
+    return (
+      <Stack gap="xs">
+        <Group justify="space-between">
+          <Text size="xs" c="dimmed">
+            Safety-Preflight
+          </Text>
+          <Button
+            size="xs"
+            variant="light"
+            onClick={() => runPreflight(params)}
+            loading={preflightRunning}
+          >
+            Preflight starten
+          </Button>
+        </Group>
+        {preflightError && (
+          <Text size="xs" c="red">
+            {preflightError}
+          </Text>
+        )}
+        {preflightKey && preflightKey !== key && (
+          <Text size="xs" c="dimmed">
+            Preflight veraltet. Bitte neu pruefen.
+          </Text>
+        )}
+        {result?.battery && result.battery.isLaptop && !result.battery.onAc && (
+          <Text size="xs" c="red">
+            Akku: {result.battery.percent ?? "?"}% - Netzteil empfohlen.
+          </Text>
+        )}
+        {blockers.map((item, index) => (
+          <Text key={`blocker-${index}`} size="xs" c="red">
+            {item}
+          </Text>
+        ))}
+        {result?.busyProcesses && result.busyProcesses.length > 0 && (
+          <Stack gap={4}>
+            {result.busyProcesses.slice(0, 6).map((proc) => (
+              <Text key={`${proc.pid}-${proc.command}`} size="xs" c="red">
+                {proc.command} (PID {proc.pid})
+              </Text>
+            ))}
+            <Button
+              size="xs"
+              color="red"
+              variant="light"
+              onClick={async () => {
+                await forceUnmount({
+                  deviceIdentifier: params.deviceIdentifier,
+                  partitionIdentifier: params.partitionIdentifier,
+                });
+                await runPreflight(params);
+              }}
+            >
+              Prozesse beenden & Unmount erzwingen
+            </Button>
+          </Stack>
+        )}
+        {warnings.map((item, index) => (
+          <Text key={`warn-${index}`} size="xs" c="yellow">
+            {item}
+          </Text>
+        ))}
+        {result?.sidecars && result.sidecars.length > 0 && (
+          <Stack gap={4}>
+            {result.sidecars.map((sidecar) => (
+              <Text key={sidecar.name} size="xs" c={sidecar.found ? "dimmed" : "red"}>
+                {sidecar.found ? "OK" : "Fehlt"}: {sidecar.name}
+              </Text>
+            ))}
+          </Stack>
+        )}
+      </Stack>
+    );
+  }
+
   return (
     <AppShell
       header={{ height: 60 }}
@@ -1055,7 +1390,10 @@ export default function App() {
           <NativeSelect
             label="Dateisystem"
             value={wipeFormatType}
-            onChange={(event) => setWipeFormatType(event.currentTarget.value)}
+            onChange={(event) => {
+              resetPreflight();
+              setWipeFormatType(event.currentTarget.value);
+            }}
             data={[
               { value: "exfat", label: "exFAT" },
               { value: "fat32", label: "FAT32" },
@@ -1068,6 +1406,11 @@ export default function App() {
               { value: "swap", label: "Linux Swap" },
             ]}
           />
+          {isExoticFs(wipeFormatType) && (
+            <Badge color="yellow" variant="light">
+              Dieses Dateisystem wird unter macOS als "unformatiert" oder "unbekannt" angezeigt werden.
+            </Badge>
+          )}
           {!isMacMountable(wipeFormatType) && (
             <Text size="xs" c="dimmed">
               Hinweis: Dieses Dateisystem wird von macOS nicht nativ gemountet.
@@ -1079,6 +1422,12 @@ export default function App() {
             onChange={(event) => setWipeLabel(event.currentTarget.value)}
             placeholder="OXIDISK"
           />
+          {selectedWipeDevice &&
+            renderPreflightBlock({
+              operation: "wipe",
+              deviceIdentifier: selectedWipeDevice.identifier,
+              formatType: wipeFormatType,
+            })}
           <TextInput
             label="Device-ID bestaetigen"
             value={wipeConfirmText}
@@ -1095,7 +1444,18 @@ export default function App() {
             <Button variant="default" onClick={() => setWipeWizardOpen(false)} disabled={wipeSubmitting}>
               Abbrechen
             </Button>
-            <Button color="red" onClick={submitWipeWizard} loading={wipeSubmitting}>
+            <Button
+              color="red"
+              onClick={submitWipeWizard}
+              loading={wipeSubmitting}
+              disabled={!preflightReady(
+                preflightKeyFor({
+                  operation: "wipe",
+                  device: selectedWipeDevice?.identifier ?? "",
+                  formatType: wipeFormatType,
+                })
+              )}
+            >
               Geraet loeschen
             </Button>
           </Group>
@@ -1139,7 +1499,10 @@ export default function App() {
           <NativeSelect
             label="Dateisystem"
             value={formatType}
-            onChange={(event) => setFormatType(event.currentTarget.value)}
+            onChange={(event) => {
+              resetPreflight();
+              setFormatType(event.currentTarget.value);
+            }}
             data={[
               { value: "exfat", label: "exFAT" },
               { value: "fat32", label: "FAT32" },
@@ -1152,6 +1515,11 @@ export default function App() {
               { value: "swap", label: "Linux Swap" },
             ]}
           />
+          {isExoticFs(formatType) && (
+            <Badge color="yellow" variant="light">
+              Dieses Dateisystem wird unter macOS als "unformatiert" oder "unbekannt" angezeigt werden.
+            </Badge>
+          )}
           {!isMacMountable(formatType) && (
             <Text size="xs" c="dimmed">
               Hinweis: Dieses Dateisystem wird von macOS nicht nativ gemountet.
@@ -1271,7 +1639,10 @@ export default function App() {
           <NativeSelect
             label="Dateisystem"
             value={createFormatType}
-            onChange={(event) => setCreateFormatType(event.currentTarget.value)}
+            onChange={(event) => {
+              resetPreflight();
+              setCreateFormatType(event.currentTarget.value);
+            }}
             data={[
               { value: "exfat", label: "exFAT" },
               { value: "fat32", label: "FAT32" },
@@ -1284,6 +1655,11 @@ export default function App() {
               { value: "swap", label: "Linux Swap" },
             ]}
           />
+          {isExoticFs(createFormatType) && (
+            <Badge color="yellow" variant="light">
+              Dieses Dateisystem wird unter macOS als "unformatiert" oder "unbekannt" angezeigt werden.
+            </Badge>
+          )}
           {!isMacMountable(createFormatType) && (
             <Text size="xs" c="dimmed">
               Hinweis: Dieses Dateisystem wird von macOS nicht nativ gemountet.
@@ -1298,6 +1674,12 @@ export default function App() {
             maxLength={labelMaxLength(createFormatType)}
             placeholder="OXIDISK"
           />
+          {createDevice &&
+            renderPreflightBlock({
+              operation: "create",
+              deviceIdentifier: createDevice.identifier,
+              formatType: createFormatType,
+            })}
           <Group gap="xs" align="flex-end">
             <NumberInput
               label="Groesse"
@@ -1342,7 +1724,17 @@ export default function App() {
             <Button variant="default" onClick={() => setCreateWizardOpen(false)} disabled={createSubmitting}>
               Abbrechen
             </Button>
-            <Button onClick={submitCreateWizard} loading={createSubmitting}>
+            <Button
+              onClick={submitCreateWizard}
+              loading={createSubmitting}
+              disabled={!preflightReady(
+                preflightKeyFor({
+                  operation: "create",
+                  device: createDevice?.identifier ?? "",
+                  formatType: createFormatType,
+                })
+              )}
+            >
               Partition erstellen
             </Button>
           </Group>
@@ -1415,6 +1807,40 @@ export default function App() {
           </Group>
         </Stack>
       </Modal>
+      <Modal
+        opened={journalOpen}
+        onClose={() => {
+          setJournalOpen(false);
+          setJournalInfo(null);
+        }}
+        title="Unvollstaendige Operation gefunden"
+        centered
+      >
+        <Stack gap="sm">
+          <Text size="sm">
+            Oxidisk hat ein Journal gefunden. Eine vorherige Move-Operation wurde moeglicherweise
+            unterbrochen.
+          </Text>
+          {journalInfo && (
+            <Text size="xs" c="dimmed">
+              Device: {journalInfo.device} • Letzter Block: {journalInfo.lastCopied ?? 0} Bytes
+            </Text>
+          )}
+          <Group justify="flex-end" mt="md">
+            <Button
+              variant="default"
+              onClick={async () => {
+                await clearOperationJournal();
+                setJournalOpen(false);
+                setJournalInfo(null);
+              }}
+            >
+              Ignorieren
+            </Button>
+            <Button onClick={handleJournalRepair}>Reparieren</Button>
+          </Group>
+        </Stack>
+      </Modal>
       <Modal opened={resizeWizardOpen} onClose={() => setResizeWizardOpen(false)} title="Groesse aendern" centered>
         <Stack gap="sm">
           <Text size="sm" c="dimmed">
@@ -1437,7 +1863,10 @@ export default function App() {
             <NumberInput
               label="Neue Groesse"
               value={resizeValue}
-              onChange={(value) => setResizeValue(typeof value === "number" ? value : undefined)}
+              onChange={(value) => {
+                resetPreflight();
+                setResizeValue(typeof value === "number" ? value : undefined);
+              }}
               min={0}
               step={0.1}
               style={{ flex: 1 }}
@@ -1445,7 +1874,10 @@ export default function App() {
             <NativeSelect
               label="Einheit"
               value={resizeUnit}
-              onChange={(event) => setResizeUnit(event.currentTarget.value)}
+              onChange={(event) => {
+                resetPreflight();
+                setResizeUnit(event.currentTarget.value);
+              }}
               data={[
                 { value: "gb", label: "GB" },
                 { value: "mb", label: "MB" },
@@ -1458,9 +1890,18 @@ export default function App() {
               min={0}
               max={Math.max(0, resizeMaxValue(resizePartition))}
               step={0.1}
-              onChange={(value) => setResizeValue(value)}
+              onChange={(value) => {
+                resetPreflight();
+                setResizeValue(value);
+              }}
             />
           )}
+          {resizePartition &&
+            renderPreflightBlock({
+              operation: "resize",
+              partitionIdentifier: resizePartition.identifier,
+              newSize: resizeSizeString(),
+            })}
           {resizeError && (
             <Text size="sm" c="red">
               {resizeError}
@@ -1470,7 +1911,17 @@ export default function App() {
             <Button variant="default" onClick={() => setResizeWizardOpen(false)} disabled={resizeSubmitting}>
               Abbrechen
             </Button>
-            <Button onClick={submitResizeWizard} loading={resizeSubmitting}>
+            <Button
+              onClick={submitResizeWizard}
+              loading={resizeSubmitting}
+              disabled={!preflightReady(
+                preflightKeyFor({
+                  operation: "resize",
+                  device: resizePartition?.identifier ?? "",
+                  newSize: resizeSizeString(),
+                })
+              )}
+            >
               Groesse aendern
             </Button>
           </Group>
@@ -1496,7 +1947,10 @@ export default function App() {
             <NumberInput
               label="Start"
               value={moveStartValue}
-              onChange={(value) => setMoveStartValue(typeof value === "number" ? value : undefined)}
+              onChange={(value) => {
+                resetPreflight();
+                setMoveStartValue(typeof value === "number" ? value : undefined);
+              }}
               min={0}
               step={1}
               style={{ flex: 1 }}
@@ -1504,7 +1958,10 @@ export default function App() {
             <NativeSelect
               label="Einheit"
               value={moveUnit}
-              onChange={(event) => setMoveUnit(event.currentTarget.value)}
+              onChange={(event) => {
+                resetPreflight();
+                setMoveUnit(event.currentTarget.value);
+              }}
               data={[
                 { value: "mb", label: "MB" },
                 { value: "gb", label: "GB" },
@@ -1516,11 +1973,28 @@ export default function App() {
               {moveError}
             </Text>
           )}
+          {movePartition &&
+            renderPreflightBlock({
+              operation: "move",
+              partitionIdentifier: movePartition.identifier,
+              newSize: moveStartString(),
+            })}
           <Group justify="flex-end" mt="md">
             <Button variant="default" onClick={() => setMoveWizardOpen(false)} disabled={moveSubmitting}>
               Abbrechen
             </Button>
-            <Button color="red" onClick={submitMoveWizard} loading={moveSubmitting}>
+            <Button
+              color="red"
+              onClick={submitMoveWizard}
+              loading={moveSubmitting}
+              disabled={!preflightReady(
+                preflightKeyFor({
+                  operation: "move",
+                  device: movePartition?.identifier ?? "",
+                  newSize: moveStartString(),
+                })
+              )}
+            >
               Verschieben
             </Button>
           </Group>
