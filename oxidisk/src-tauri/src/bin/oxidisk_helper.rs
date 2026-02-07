@@ -1,11 +1,18 @@
 use plist::Value as PlistValue;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use sha2::{Digest, Sha256};
+use regex::Regex;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::OpenOptionsExt;
 
 #[path = "../partitioning/fs_driver.rs"]
 mod fs_driver;
@@ -57,6 +64,10 @@ fn main() {
         "apfs_add_volume" => handle_apfs_add_volume(&request.payload),
         "apfs_delete_volume" => handle_apfs_delete_volume(&request.payload),
         "flash_image" => handle_flash_image(&request.payload),
+        "inspect_image" => handle_inspect_image(&request.payload),
+        "hash_image" => handle_hash_image(&request.payload),
+        "backup_image" => handle_backup_image(&request.payload),
+        "windows_install" => handle_windows_install(&request.payload),
         "get_journal" => handle_get_journal(),
         "clear_journal" => handle_clear_journal(),
         _ => Err("Unknown action".to_string()),
@@ -445,6 +456,142 @@ fn handle_flash_image(payload: &Value) -> Result<Option<Value>, String> {
         "verifiedHash": verified_hash,
         "verified": verify,
     })))
+}
+
+fn handle_inspect_image(payload: &Value) -> Result<Option<Value>, String> {
+    let source_path = read_string(payload, "sourcePath")?;
+    let (is_windows, reason) = detect_windows_iso(&source_path)?;
+    let (brand, label) = detect_image_brand(&source_path, is_windows)?;
+    Ok(Some(json!({
+        "isWindows": is_windows,
+        "reason": reason,
+        "brand": brand,
+        "label": label,
+    })))
+}
+
+fn handle_hash_image(payload: &Value) -> Result<Option<Value>, String> {
+    let source_path = read_string(payload, "sourcePath")?;
+    let file_size = std::fs::metadata(&source_path)
+        .map_err(|e| format!("Image read failed: {e}"))?
+        .len();
+
+    let hash = hash_file_with_progress(&source_path, file_size)?;
+    Ok(Some(json!({
+        "bytes": file_size,
+        "sha256": hash,
+    })))
+}
+
+fn handle_backup_image(payload: &Value) -> Result<Option<Value>, String> {
+    let source_device = read_string(payload, "sourceDevice")?;
+    let target_path = read_string(payload, "targetPath")?;
+    let compress = payload
+        .get("compress")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let device = normalize_device(&source_device);
+    let raw_device = raw_device_path(&device);
+    let disk_size = read_disk_size(&device).unwrap_or(0);
+    if disk_size == 0 {
+        return Err("Unable to determine device size".to_string());
+    }
+
+    emit_log("backup", "Unmounting source disk");
+    force_unmount_disk(&device)?;
+
+    emit_log("backup", "Reading image");
+    let (bytes_written, source_hash) = backup_read_to_file(&raw_device, &target_path, disk_size, compress)?;
+
+    emit_log("backup", "Verifying backup");
+    let target_hash = if compress {
+        hash_gzip_file_with_progress(&target_path, disk_size)?
+    } else {
+        hash_file_with_progress(&target_path, disk_size)?
+    };
+
+    if source_hash != target_hash {
+        return Err("Backup verification failed: checksum mismatch".to_string());
+    }
+
+    Ok(Some(json!({
+        "source": device,
+        "target": target_path,
+        "bytes": bytes_written,
+        "compressed": compress,
+        "verified": true,
+        "sha256": source_hash,
+    })))
+}
+
+fn handle_windows_install(payload: &Value) -> Result<Option<Value>, String> {
+    let source_path = read_string(payload, "sourcePath")?;
+    let target_device = read_string(payload, "targetDevice")?;
+    let label = payload
+        .get("label")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "WINSTALL".to_string());
+    let tpm_bypass = payload
+        .get("tpmBypass")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let local_account = payload
+        .get("localAccount")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let privacy_defaults = payload
+        .get("privacyDefaults")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let device = normalize_device(&target_device);
+    let mount_point = "/tmp/oxidisk_win_iso";
+    let mut iso_mounted = false;
+
+    let result = (|| -> Result<Option<Value>, String> {
+        emit_log("win", "Erasing target disk (GPT + ExFAT)");
+        run_diskutil(["eraseDisk", "ExFAT", &label, "GPT", &device])?;
+
+        let volume_id = find_partition_by_label(&label)?
+            .ok_or_else(|| "Windows target volume not found".to_string())?;
+        let volume_device = normalize_device(&volume_id);
+        let volume_mount = read_mount_point(&volume_device)?
+            .ok_or_else(|| "Target volume not mounted".to_string())?;
+
+        emit_log("win", "Mounting ISO");
+        mount_iso_at(&source_path, mount_point)?;
+        iso_mounted = true;
+
+        let total_bytes = directory_size(mount_point)?;
+        if total_bytes == 0 {
+            return Err("ISO appears empty".to_string());
+        }
+
+        emit_log("win", "Copying files");
+        copy_dir_with_progress(mount_point, &volume_mount, total_bytes)?;
+
+        if tpm_bypass || local_account || privacy_defaults {
+            emit_log("win", "Writing autounattend.xml");
+            write_autounattend_xml(&volume_mount, tpm_bypass, local_account, privacy_defaults)?;
+        }
+
+        emit_log("win", "Finalizing");
+        run_diskutil(["unmountDisk", "force", &device])?;
+
+        Ok(Some(json!({
+            "source": source_path,
+            "target": device,
+            "mountPoint": volume_mount,
+        })))
+    })();
+
+    if iso_mounted {
+        let _ = run_hdiutil(["detach", mount_point]);
+    }
+
+    result
 }
 
 fn handle_preflight_check(payload: &Value) -> Result<Option<Value>, String> {
@@ -1042,6 +1189,30 @@ fn raw_device_path(device: &str) -> String {
     }
 }
 
+fn open_device_for_write(path: &str) -> Result<std::fs::File, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    #[cfg(target_os = "macos")]
+    {
+        options.custom_flags(libc::O_EXLOCK);
+    }
+    options
+        .open(path)
+        .map_err(|e| format!("Open target failed: {e}"))
+}
+
+fn open_device_for_read(path: &str) -> Result<std::fs::File, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "macos")]
+    {
+        options.custom_flags(libc::O_EXLOCK);
+    }
+    options
+        .open(path)
+        .map_err(|e| format!("Open source failed: {e}"))
+}
+
 fn read_disk_size(device: &str) -> Option<u64> {
     let output = Command::new("diskutil")
         .args(["info", "-plist", device])
@@ -1066,10 +1237,7 @@ fn flash_write_with_hash(source_path: &str, target_device: &str, total_bytes: u6
         .read(true)
         .open(source_path)
         .map_err(|e| format!("Open image failed: {e}"))?;
-    let mut target = std::fs::OpenOptions::new()
-        .write(true)
-        .open(target_device)
-        .map_err(|e| format!("Open target failed: {e}"))?;
+    let mut target = open_device_for_write(target_device)?;
 
     let buffer_size = 4 * 1024 * 1024;
     let mut buffer = vec![0u8; buffer_size];
@@ -1078,6 +1246,10 @@ fn flash_write_with_hash(source_path: &str, target_device: &str, total_bytes: u6
     let progress_step: u64 = 50 * 1024 * 1024;
     let mut next_progress = progress_step;
     let mut hasher = Sha256::new();
+    let mut last_progress_at = Instant::now();
+    let mut last_progress_bytes: u64 = 0;
+    let mut slow_streak = 0u32;
+    let mut warned = false;
 
     while remaining > 0 {
         let chunk = std::cmp::min(buffer_size as u64, remaining) as usize;
@@ -1087,9 +1259,26 @@ fn flash_write_with_hash(source_path: &str, target_device: &str, total_bytes: u6
         remaining -= chunk as u64;
         copied += chunk as u64;
         if copied >= next_progress || remaining == 0 {
+            let elapsed = last_progress_at.elapsed().as_secs_f64().max(0.001);
+            let delta = copied.saturating_sub(last_progress_bytes);
+            let speed = (delta as f64 / (1024.0 * 1024.0)) / elapsed;
             let percent = ((copied as f64 / total_bytes as f64) * 100.0).round() as u64;
             emit_progress_bytes("flash", percent, 100, Some("Writing image"), copied, total_bytes);
             next_progress += progress_step;
+            last_progress_at = Instant::now();
+            last_progress_bytes = copied;
+            if speed < 1.0 && copied < (total_bytes * 9 / 10) {
+                slow_streak += 1;
+            } else {
+                slow_streak = 0;
+            }
+            if slow_streak >= 3 && !warned {
+                emit_log(
+                    "flash",
+                    "Warnung: Sehr langsamer Schreibdurchsatz. Stick koennte defekt oder gefaelscht sein.",
+                );
+                warned = true;
+            }
         }
     }
 
@@ -1104,10 +1293,7 @@ fn flash_verify_with_hash(target_device: &str, total_bytes: u64) -> Result<Strin
         return Err("Image is empty".to_string());
     }
 
-    let mut target = std::fs::OpenOptions::new()
-        .read(true)
-        .open(target_device)
-        .map_err(|e| format!("Open target failed: {e}"))?;
+    let mut target = open_device_for_read(target_device)?;
 
     let buffer_size = 4 * 1024 * 1024;
     let mut buffer = vec![0u8; buffer_size];
@@ -1132,6 +1318,616 @@ fn flash_verify_with_hash(target_device: &str, total_bytes: u64) -> Result<Strin
 
     let hash = hasher.finalize();
     Ok(format!("{:x}", hash))
+}
+
+fn hash_file_with_progress(path: &str, total_bytes: u64) -> Result<String, String> {
+    if total_bytes == 0 {
+        return Err("Image is empty".to_string());
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|e| format!("Open image failed: {e}"))?;
+
+    let buffer_size = 4 * 1024 * 1024;
+    let mut buffer = vec![0u8; buffer_size];
+    let mut remaining = total_bytes;
+    let mut copied: u64 = 0;
+    let progress_step: u64 = 50 * 1024 * 1024;
+    let mut next_progress = progress_step;
+    let mut hasher = Sha256::new();
+
+    while remaining > 0 {
+        let chunk = std::cmp::min(buffer_size as u64, remaining) as usize;
+        file.read_exact(&mut buffer[..chunk]).map_err(|e| e.to_string())?;
+        hasher.update(&buffer[..chunk]);
+        remaining -= chunk as u64;
+        copied += chunk as u64;
+        if copied >= next_progress || remaining == 0 {
+            let percent = ((copied as f64 / total_bytes as f64) * 100.0).round() as u64;
+            emit_progress_bytes("hash", percent, 100, Some("Hashing image"), copied, total_bytes);
+            next_progress += progress_step;
+        }
+    }
+
+    let hash = hasher.finalize();
+    Ok(format!("{:x}", hash))
+}
+
+fn backup_read_to_file(
+    source_device: &str,
+    target_path: &str,
+    total_bytes: u64,
+    compress: bool,
+) -> Result<(u64, String), String> {
+    let mut source = open_device_for_read(source_device)?;
+
+    let target_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(target_path)
+        .map_err(|e| format!("Open target failed: {e}"))?;
+
+    let mut writer: Box<dyn Write> = if compress {
+        Box::new(GzEncoder::new(target_file, Compression::default()))
+    } else {
+        Box::new(target_file)
+    };
+
+    let buffer_size = 4 * 1024 * 1024;
+    let mut buffer = vec![0u8; buffer_size];
+    let mut remaining = total_bytes;
+    let mut copied: u64 = 0;
+    let progress_step: u64 = 50 * 1024 * 1024;
+    let mut next_progress = progress_step;
+    let mut hasher = Sha256::new();
+    let mut last_progress_at = Instant::now();
+    let mut last_progress_bytes: u64 = 0;
+    let mut slow_streak = 0u32;
+    let mut warned = false;
+
+    while remaining > 0 {
+        let chunk = std::cmp::min(buffer_size as u64, remaining) as usize;
+        source.read_exact(&mut buffer[..chunk]).map_err(|e| e.to_string())?;
+        writer.write_all(&buffer[..chunk]).map_err(|e| e.to_string())?;
+        hasher.update(&buffer[..chunk]);
+        remaining -= chunk as u64;
+        copied += chunk as u64;
+        if copied >= next_progress || remaining == 0 {
+            let elapsed = last_progress_at.elapsed().as_secs_f64().max(0.001);
+            let delta = copied.saturating_sub(last_progress_bytes);
+            let speed = (delta as f64 / (1024.0 * 1024.0)) / elapsed;
+            let percent = ((copied as f64 / total_bytes as f64) * 100.0).round() as u64;
+            emit_progress_bytes("backup", percent, 100, Some("Reading device"), copied, total_bytes);
+            next_progress += progress_step;
+            last_progress_at = Instant::now();
+            last_progress_bytes = copied;
+            if speed < 1.0 && copied < (total_bytes * 9 / 10) {
+                slow_streak += 1;
+            } else {
+                slow_streak = 0;
+            }
+            if slow_streak >= 3 && !warned {
+                emit_log(
+                    "backup",
+                    "Warnung: Sehr langsamer Lesedurchsatz. Stick koennte defekt oder gefaelscht sein.",
+                );
+                warned = true;
+            }
+        }
+    }
+
+    writer.flush().map_err(|e| format!("Flush failed: {e}"))?;
+
+    let hash = hasher.finalize();
+    Ok((copied, format!("{:x}", hash)))
+}
+
+fn hash_gzip_file_with_progress(path: &str, total_bytes: u64) -> Result<String, String> {
+    if total_bytes == 0 {
+        return Err("Image is empty".to_string());
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|e| format!("Open image failed: {e}"))?;
+    let mut reader = GzDecoder::new(file);
+
+    let buffer_size = 4 * 1024 * 1024;
+    let mut buffer = vec![0u8; buffer_size];
+    let mut remaining = total_bytes;
+    let mut copied: u64 = 0;
+    let progress_step: u64 = 50 * 1024 * 1024;
+    let mut next_progress = progress_step;
+    let mut hasher = Sha256::new();
+
+    while remaining > 0 {
+        let chunk = std::cmp::min(buffer_size as u64, remaining) as usize;
+        let read = reader.read(&mut buffer[..chunk]).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+        copied += read as u64;
+        if copied >= next_progress || remaining == 0 {
+            let percent = ((copied as f64 / total_bytes as f64) * 100.0).round() as u64;
+            emit_progress_bytes("backup-verify", percent, 100, Some("Verifying backup"), copied, total_bytes);
+            next_progress += progress_step;
+        }
+    }
+
+    let hash = hasher.finalize();
+    Ok(format!("{:x}", hash))
+}
+
+fn detect_windows_iso(path: &str) -> Result<(bool, Option<String>), String> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|e| format!("Open image failed: {e}"))?;
+
+    let mut header = vec![0u8; 1024 * 1024];
+    let header_len = file.read(&mut header).map_err(|e| e.to_string())?;
+    header.truncate(header_len);
+
+    if contains_bytes(&header, b"NSR02") || contains_bytes(&header, b"NSR03") {
+        return Ok((true, Some("UDF/Windows installer detected".to_string())));
+    }
+
+    let mut tail_buffer = Vec::new();
+    let mut remaining: u64 = 16 * 1024 * 1024;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    while remaining > 0 {
+        let chunk = std::cmp::min(buffer.len() as u64, remaining) as usize;
+        let read = file.read(&mut buffer[..chunk]).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        remaining -= read as u64;
+        tail_buffer.extend_from_slice(&buffer[..read]);
+        if tail_buffer.len() > 8 * 1024 * 1024 {
+            tail_buffer.drain(..tail_buffer.len() - 4 * 1024 * 1024);
+        }
+        if contains_bytes(&tail_buffer, b"sources/install.wim") || contains_bytes(&tail_buffer, b"install.wim") {
+            return Ok((true, Some("install.wim found".to_string())));
+        }
+    }
+
+    Ok((false, None))
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|window| window == needle)
+}
+
+fn detect_image_brand(path: &str, is_windows: bool) -> Result<(Option<String>, Option<String>), String> {
+    if is_windows {
+        return Ok((Some("windows".to_string()), Some("Windows".to_string())));
+    }
+
+    if is_dmg(path).unwrap_or(false) {
+        return Ok((Some("macos".to_string()), Some("macOS".to_string())));
+    }
+
+    if let Ok((volume_id, disk_info)) = read_iso_metadata(path) {
+        if let Some(info) = disk_info {
+            let info_line = info.lines().next().unwrap_or("").trim().to_string();
+            if let Some((brand, label)) = brand_from_text(&info_line) {
+                return Ok((Some(brand), Some(label)));
+            }
+            if !info_line.is_empty() {
+                return Ok((Some("linux".to_string()), Some(info_line)));
+            }
+        }
+
+        if let Some((brand, label)) = brand_from_text(&volume_id) {
+            return Ok((Some(brand), Some(label)));
+        }
+
+        if !volume_id.is_empty() {
+            return Ok((Some("linux".to_string()), Some(volume_id)));
+        }
+    }
+
+    Ok((None, None))
+}
+
+fn brand_from_text(text: &str) -> Option<(String, String)> {
+    let normalized = text.to_lowercase();
+    if normalized.contains("ubuntu") {
+        return Some(("ubuntu".to_string(), text.to_string()));
+    }
+    if normalized.contains("linux mint") || normalized.contains("mint") {
+        return Some(("mint".to_string(), text.to_string()));
+    }
+    if normalized.contains("arch") {
+        return Some(("arch".to_string(), text.to_string()));
+    }
+    if normalized.contains("fedora") {
+        return Some(("fedora".to_string(), text.to_string()));
+    }
+    if normalized.contains("debian") {
+        return Some(("debian".to_string(), text.to_string()));
+    }
+    if normalized.contains("kali") {
+        return Some(("kali".to_string(), text.to_string()));
+    }
+    if normalized.contains("manjaro") {
+        return Some(("manjaro".to_string(), text.to_string()));
+    }
+    if normalized.contains("opensuse") || normalized.contains("open suse") || normalized.contains("suse") {
+        return Some(("opensuse".to_string(), text.to_string()));
+    }
+    None
+}
+
+fn is_dmg(path: &str) -> Result<bool, String> {
+    if !path.to_lowercase().ends_with(".dmg") {
+        return Ok(false);
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|e| format!("Open image failed: {e}"))?;
+    let size = file.metadata().map_err(|e| e.to_string())?.len();
+    if size < 512 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::End(-512)).map_err(|e| e.to_string())?;
+    let mut buffer = vec![0u8; 512];
+    file.read_exact(&mut buffer).map_err(|e| e.to_string())?;
+    Ok(buffer[508..512] == *b"koly")
+}
+
+fn read_iso_metadata(path: &str) -> Result<(String, Option<String>), String> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|e| format!("Open image failed: {e}"))?;
+    let pvd = read_primary_volume_descriptor(&mut file)?;
+    let volume_id = pvd.volume_id.trim().to_string();
+
+    let disk_info = read_disk_info(&mut file, &pvd);
+    Ok((volume_id, disk_info))
+}
+
+struct IsoPvd {
+    volume_id: String,
+    root_extent: u32,
+    root_size: u32,
+}
+
+fn read_primary_volume_descriptor(file: &mut std::fs::File) -> Result<IsoPvd, String> {
+    const PVD_OFFSET: u64 = 0x8000;
+    const PVD_SIZE: usize = 2048;
+    file.seek(SeekFrom::Start(PVD_OFFSET)).map_err(|e| e.to_string())?;
+    let mut buffer = vec![0u8; PVD_SIZE];
+    file.read_exact(&mut buffer).map_err(|e| e.to_string())?;
+    if buffer[0] != 0x01 || &buffer[1..6] != b"CD001" {
+        return Err("Not an ISO9660 image".to_string());
+    }
+
+    let volume_id = String::from_utf8_lossy(&buffer[40..72]).trim().to_string();
+    let root = &buffer[156..190];
+    let root_extent = u32::from_le_bytes([root[2], root[3], root[4], root[5]]);
+    let root_size = u32::from_le_bytes([root[10], root[11], root[12], root[13]]);
+
+    Ok(IsoPvd {
+        volume_id,
+        root_extent,
+        root_size,
+    })
+}
+
+fn read_disk_info(file: &mut std::fs::File, pvd: &IsoPvd) -> Option<String> {
+    let entries = read_iso_directory(file, pvd.root_extent, pvd.root_size).ok()?;
+    let disk_dir = entries
+        .iter()
+        .find(|entry| entry.name == ".disk" && entry.is_dir)?;
+    let disk_entries = read_iso_directory(file, disk_dir.extent, disk_dir.size).ok()?;
+    let info_entry = disk_entries
+        .iter()
+        .find(|entry| entry.name == "info" && !entry.is_dir)?;
+    let content = read_iso_file(file, info_entry.extent, info_entry.size).ok()?;
+    Some(content)
+}
+
+struct IsoDirEntry {
+    name: String,
+    extent: u32,
+    size: u32,
+    is_dir: bool,
+}
+
+fn read_iso_directory(file: &mut std::fs::File, extent: u32, size: u32) -> Result<Vec<IsoDirEntry>, String> {
+    let offset = extent as u64 * 2048;
+    file.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+    let mut buffer = vec![0u8; size as usize];
+    file.read_exact(&mut buffer).map_err(|e| e.to_string())?;
+
+    let mut entries = Vec::new();
+    let mut index = 0usize;
+    while index < buffer.len() {
+        let len = buffer[index] as usize;
+        if len == 0 {
+            let next_sector = ((index / 2048) + 1) * 2048;
+            index = next_sector;
+            continue;
+        }
+        if index + len > buffer.len() {
+            break;
+        }
+        let record = &buffer[index..index + len];
+        let extent = u32::from_le_bytes([record[2], record[3], record[4], record[5]]);
+        let size = u32::from_le_bytes([record[10], record[11], record[12], record[13]]);
+        let flags = record[25];
+        let name_len = record[32] as usize;
+        let name_bytes = &record[33..33 + name_len];
+        let name = match name_bytes {
+            [0] => ".".to_string(),
+            [1] => "..".to_string(),
+            _ => String::from_utf8_lossy(name_bytes).to_string(),
+        };
+        let name = name.trim_end_matches(";1").to_string();
+        let is_dir = flags & 0x02 != 0;
+        entries.push(IsoDirEntry {
+            name: name.to_lowercase(),
+            extent,
+            size,
+            is_dir,
+        });
+        index += len;
+    }
+
+    Ok(entries)
+}
+
+fn read_iso_file(file: &mut std::fs::File, extent: u32, size: u32) -> Result<String, String> {
+    let offset = extent as u64 * 2048;
+    file.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+    let mut buffer = vec![0u8; size.min(64 * 1024) as usize];
+    file.read_exact(&mut buffer).map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&buffer).trim().to_string())
+}
+
+fn run_hdiutil<I, S>(args: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let output = Command::new("hdiutil")
+        .args(args)
+        .output()
+        .map_err(|e| format!("hdiutil failed: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("hdiutil error: {stderr}"));
+    }
+
+    Ok(())
+}
+
+fn mount_iso_at(path: &str, mount_point: &str) -> Result<(), String> {
+    std::fs::create_dir_all(mount_point).map_err(|e| format!("Mount dir failed: {e}"))?;
+    run_hdiutil([
+        "attach",
+        "-nobrowse",
+        "-readonly",
+        "-mountpoint",
+        mount_point,
+        path,
+    ])?;
+    if !std::path::Path::new(mount_point).exists() {
+        return Err("ISO mount failed".to_string());
+    }
+    Ok(())
+}
+
+fn directory_size(path: &str) -> Result<u64, String> {
+    let mut total: u64 = 0;
+    let entries = std::fs::read_dir(path).map_err(|e| format!("Read dir failed: {e}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Read dir failed: {e}"))?;
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if should_skip_entry(&name) {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            total += directory_size(path.to_str().unwrap_or(""))?;
+        } else if file_type.is_file() {
+            total += entry.metadata().map_err(|e| e.to_string())?.len();
+        }
+    }
+    Ok(total)
+}
+
+fn copy_dir_with_progress(source: &str, destination: &str, total_bytes: u64) -> Result<(), String> {
+    let mut copied: u64 = 0;
+    let progress_step: u64 = 50 * 1024 * 1024;
+    let mut next_progress = progress_step;
+    copy_dir_inner(
+        source,
+        destination,
+        source,
+        total_bytes,
+        &mut copied,
+        &mut next_progress,
+    )?;
+    emit_progress_bytes("win_copy", 100, 100, Some("Copy complete"), copied, total_bytes);
+    Ok(())
+}
+
+fn copy_dir_inner(
+    source: &str,
+    destination: &str,
+    base_root: &str,
+    total_bytes: u64,
+    copied: &mut u64,
+    next_progress: &mut u64,
+) -> Result<(), String> {
+    std::fs::create_dir_all(destination).map_err(|e| format!("Create dir failed: {e}"))?;
+    let entries = std::fs::read_dir(source).map_err(|e| format!("Read dir failed: {e}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Read dir failed: {e}"))?;
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if should_skip_entry(&name) {
+            continue;
+        }
+        let source_path = entry.path();
+        let target_path = std::path::Path::new(destination).join(&*name);
+        if file_type.is_dir() {
+            copy_dir_inner(
+                source_path.to_str().unwrap_or(""),
+                target_path.to_str().unwrap_or(""),
+                base_root,
+                total_bytes,
+                copied,
+                next_progress,
+            )?;
+        } else if file_type.is_file() {
+            let relative = source_path
+                .strip_prefix(base_root)
+                .unwrap_or(&source_path)
+                .to_string_lossy()
+                .trim_start_matches('/')
+                .to_string();
+            copy_file_with_progress(
+                source_path.to_str().unwrap_or(""),
+                target_path.to_str().unwrap_or(""),
+                &relative,
+                total_bytes,
+                copied,
+                next_progress,
+            )?;
+        } else if file_type.is_symlink() {
+            emit_log("win", &format!("Skip symlink: {name}"));
+        }
+    }
+    Ok(())
+}
+
+fn copy_file_with_progress(
+    source: &str,
+    destination: &str,
+    display_name: &str,
+    total_bytes: u64,
+    copied: &mut u64,
+    next_progress: &mut u64,
+) -> Result<(), String> {
+    let mut reader = std::fs::OpenOptions::new()
+        .read(true)
+        .open(source)
+        .map_err(|e| format!("Open source failed: {e}"))?;
+    let mut writer = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(destination)
+        .map_err(|e| format!("Open target failed: {e}"))?;
+
+    let buffer_size = 4 * 1024 * 1024;
+    let mut buffer = vec![0u8; buffer_size];
+    let start = Instant::now();
+    let mut file_copied: u64 = 0;
+    loop {
+        let read = reader.read(&mut buffer).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..read]).map_err(|e| e.to_string())?;
+        *copied += read as u64;
+        file_copied += read as u64;
+        if *copied >= *next_progress || *copied >= total_bytes {
+            let elapsed = start.elapsed().as_secs_f64().max(0.001);
+            let speed = (file_copied as f64 / (1024.0 * 1024.0)) / elapsed;
+            let percent = ((
+                *copied as f64 / if total_bytes == 0 { 1.0 } else { total_bytes as f64 }
+            ) * 100.0)
+                .round() as u64;
+            let message = format!("Copying {display_name} · {speed:.1} MB/s");
+            emit_progress_bytes("win_copy", percent, 100, Some(&message), *copied, total_bytes);
+            *next_progress += 50 * 1024 * 1024;
+        }
+    }
+    writer.flush().map_err(|e| format!("Flush failed: {e}"))?;
+    Ok(())
+}
+
+fn should_skip_entry(name: &str) -> bool {
+    name == ".DS_Store"
+}
+
+fn write_autounattend_xml(
+    mount_point: &str,
+    tpm_bypass: bool,
+    local_account: bool,
+    privacy_defaults: bool,
+) -> Result<(), String> {
+    let xml = build_autounattend_xml(tpm_bypass, local_account, privacy_defaults);
+    let path = std::path::Path::new(mount_point).join("autounattend.xml");
+    std::fs::write(&path, xml).map_err(|e| format!("Write autounattend failed: {e}"))?;
+    Ok(())
+}
+
+fn build_autounattend_xml(tpm_bypass: bool, local_account: bool, privacy_defaults: bool) -> String {
+    let mut run_sync = Vec::new();
+    if tpm_bypass {
+        run_sync.push(
+            r#"<RunSynchronousCommand wcm:action="add"><Order>1</Order><Path>cmd /c reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\LabConfig /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>"#
+                .to_string(),
+        );
+        run_sync.push(
+            r#"<RunSynchronousCommand wcm:action="add"><Order>2</Order><Path>cmd /c reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>"#
+                .to_string(),
+        );
+        run_sync.push(
+            r#"<RunSynchronousCommand wcm:action="add"><Order>3</Order><Path>cmd /c reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\LabConfig /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>"#
+                .to_string(),
+        );
+    }
+    if local_account {
+        run_sync.push(
+            r#"<RunSynchronousCommand wcm:action="add"><Order>4</Order><Path>cmd /c reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE /v BypassNRO /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>"#
+                .to_string(),
+        );
+    }
+
+    let run_sync_block = if run_sync.is_empty() {
+        String::new()
+    } else {
+        format!("<RunSynchronous>{}</RunSynchronous>", run_sync.join(""))
+    };
+
+    let mut oobe_lines = Vec::new();
+    if local_account {
+        oobe_lines.push("<HideOnlineAccountScreens>true</HideOnlineAccountScreens>".to_string());
+        oobe_lines.push("<HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>".to_string());
+    }
+    if privacy_defaults {
+        oobe_lines.push("<ProtectYourPC>3</ProtectYourPC>".to_string());
+        oobe_lines.push("<HideEULAPage>true</HideEULAPage>".to_string());
+    }
+
+    let oobe_block = if oobe_lines.is_empty() {
+        String::new()
+    } else {
+        format!("<OOBE>{}</OOBE>", oobe_lines.join(""))
+    };
+
+    format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<unattend xmlns=\"urn:schemas-microsoft-com:unattend\" xmlns:wcm=\"http://schemas.microsoft.com/WMIConfig/2002/State\">\n  <settings pass=\"windowsPE\">\n    <component name=\"Microsoft-Windows-Setup\" processorArchitecture=\"amd64\" publicKeyToken=\"31bf3856ad364e35\" language=\"neutral\" versionScope=\"nonSxS\">\n      {run_sync_block}\n    </component>\n  </settings>\n  <settings pass=\"oobeSystem\">\n    <component name=\"Microsoft-Windows-Shell-Setup\" processorArchitecture=\"amd64\" publicKeyToken=\"31bf3856ad364e35\" language=\"neutral\" versionScope=\"nonSxS\">\n      {oobe_block}\n    </component>\n  </settings>\n</unattend>\n"
+    )
 }
 
 fn create_linux_partition(device: &str, fs: &str, label: &str, size: &str) -> Result<Option<Value>, String> {

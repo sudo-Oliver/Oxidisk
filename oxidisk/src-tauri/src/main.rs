@@ -347,6 +347,7 @@ fn format_bytes(bytes: u64) -> String {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             get_disks,
             scan_directory,
@@ -376,6 +377,12 @@ fn main() {
             partitioning::apfs_add_volume,
             partitioning::apfs_delete_volume,
             partitioning::flash_image,
+            partitioning::inspect_image,
+            partitioning::hash_image,
+            partitioning::backup_image,
+            partitioning::windows_install,
+            partitioning::cancel_helper_operation,
+            partitioning::eject_disk,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

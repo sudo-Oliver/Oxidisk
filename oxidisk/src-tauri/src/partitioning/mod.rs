@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use tauri::path::BaseDirectory;
 use tauri::{Emitter, Manager};
 
@@ -114,6 +115,33 @@ pub struct FlashImageRequest {
 }
 
 #[derive(Deserialize)]
+pub struct InspectImageRequest {
+    source_path: String,
+}
+
+#[derive(Deserialize)]
+pub struct HashImageRequest {
+    source_path: String,
+}
+
+#[derive(Deserialize)]
+pub struct BackupImageRequest {
+    source_device: String,
+    target_path: String,
+    compress: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct WindowsInstallRequest {
+    source_path: String,
+    target_device: String,
+    label: Option<String>,
+    tpm_bypass: Option<bool>,
+    local_account: Option<bool>,
+    privacy_defaults: Option<bool>,
+}
+
+#[derive(Deserialize)]
 pub struct PreflightRequest {
     device_identifier: Option<String>,
     partition_identifier: Option<String>,
@@ -185,6 +213,20 @@ struct SudoersInstallResult {
     sudoers_path: String,
 }
 
+static ACTIVE_HELPER_PID: OnceLock<Mutex<Option<u32>>> = OnceLock::new();
+
+fn set_active_helper_pid(pid: Option<u32>) {
+    let lock = ACTIVE_HELPER_PID.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = lock.lock() {
+        *guard = pid;
+    }
+}
+
+fn get_active_helper_pid() -> Option<u32> {
+    let lock = ACTIVE_HELPER_PID.get_or_init(|| Mutex::new(None));
+    lock.lock().ok().and_then(|guard| *guard)
+}
+
 #[tauri::command]
 pub fn get_partition_devices() -> Vec<PartitionDevice> {
     #[cfg(target_os = "macos")]
@@ -227,10 +269,7 @@ pub fn get_partition_devices() -> Vec<PartitionDevice> {
                 .to_string();
 
             let size = disk_dict.get("Size").and_then(|v| v.as_unsigned_integer()).unwrap_or(0);
-            let internal = disk_dict
-                .get("Internal")
-                .and_then(|v| v.as_boolean())
-                .unwrap_or(true);
+            let internal = !disk_external_flag(&identifier, disk_dict);
             let content = disk_dict
                 .get("Content")
                 .and_then(|v| v.as_string())
@@ -366,6 +405,72 @@ fn partition_fs_type(identifier: &str) -> Option<String> {
     }
 
     None
+}
+
+#[cfg(target_os = "macos")]
+fn disk_external_flag(identifier: &str, disk_dict: &plist::Dictionary) -> bool {
+    if let Some(external) = disk_external_flag_from_info(identifier) {
+        return external;
+    }
+
+    disk_external_flag_from_dict(disk_dict)
+}
+
+#[cfg(target_os = "macos")]
+fn disk_external_flag_from_info(identifier: &str) -> Option<bool> {
+    let device = if identifier.starts_with("/dev/") {
+        identifier.to_string()
+    } else {
+        format!("/dev/{identifier}")
+    };
+
+    let output = Command::new("diskutil")
+        .args(["info", "-plist", &device])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let plist = plist::Value::from_reader_xml(&output.stdout[..]).ok()?;
+    let dict = plist.as_dictionary()?;
+    Some(disk_external_flag_from_dict(dict))
+}
+
+#[cfg(target_os = "macos")]
+fn disk_external_flag_from_dict(dict: &plist::Dictionary) -> bool {
+    let bus_protocol = dict
+        .get("BusProtocol")
+        .and_then(|v| v.as_string())
+        .unwrap_or("")
+        .to_lowercase();
+    let ejectable = dict
+        .get("Ejectable")
+        .and_then(|v| v.as_boolean())
+        .unwrap_or(false);
+    let removable = dict
+        .get("RemovableMedia")
+        .and_then(|v| v.as_boolean())
+        .unwrap_or(false);
+    let removable_or_external = dict
+        .get("RemovableMediaOrExternalDevice")
+        .and_then(|v| v.as_boolean())
+        .unwrap_or(false);
+    let internal = dict
+        .get("Internal")
+        .and_then(|v| v.as_boolean())
+        .unwrap_or(true);
+    let virtual_or_physical = dict
+        .get("VirtualOrPhysical")
+        .and_then(|v| v.as_string())
+        .unwrap_or("")
+        .to_lowercase();
+    let is_virtual = virtual_or_physical == "virtual";
+    let external_bus = ["usb", "thunderbolt", "firewire", "sd", "sdc"]
+        .iter()
+        .any(|hint| bus_protocol.contains(hint));
+
+    !is_virtual && (external_bus || ejectable || removable || removable_or_external || !internal)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -529,6 +634,8 @@ fn run_helper(app: &tauri::AppHandle, request: HelperRequest) -> Result<HelperRe
             .spawn()
             .map_err(|e| format!("Helper start failed: {e}"))?;
 
+        set_active_helper_pid(Some(child.id()));
+
         if let Some(mut stdin) = child.stdin.take() {
             stdin
                 .write_all(&request_json)
@@ -617,6 +724,8 @@ fn run_helper_stream(
         let status = child.wait().map_err(|e| format!("Helper run failed: {e}"))?;
         let mut stderr_text = String::new();
         let _ = stderr_reader.read_to_string(&mut stderr_text);
+
+        set_active_helper_pid(None);
 
         if !status.success() {
             if stderr_text.contains("a password is required") {
@@ -962,6 +1071,114 @@ pub fn flash_image(
 }
 
 #[tauri::command]
+pub fn inspect_image(app: tauri::AppHandle, request: InspectImageRequest) -> Result<HelperResponse, String> {
+    let payload = json!({
+        "sourcePath": request.source_path,
+    });
+
+    let response = run_helper(
+        &app,
+        HelperRequest {
+            action: "inspect_image".to_string(),
+            payload,
+        },
+    )?;
+
+    ok_or_message(response)
+}
+
+#[tauri::command]
+pub fn hash_image(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    request: HashImageRequest,
+) -> Result<HelperResponse, String> {
+    let payload = json!({
+        "sourcePath": request.source_path,
+    });
+
+    let response = run_helper_stream(
+        &app,
+        &window,
+        HelperRequest {
+            action: "hash_image".to_string(),
+            payload,
+        },
+    )?;
+
+    ok_or_message(response)
+}
+
+#[tauri::command]
+pub fn backup_image(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    request: BackupImageRequest,
+) -> Result<HelperResponse, String> {
+    let payload = json!({
+        "sourceDevice": request.source_device,
+        "targetPath": request.target_path,
+        "compress": request.compress.unwrap_or(false),
+    });
+
+    let response = run_helper_stream(
+        &app,
+        &window,
+        HelperRequest {
+            action: "backup_image".to_string(),
+            payload,
+        },
+    )?;
+
+    ok_or_message(response)
+}
+
+#[tauri::command]
+pub fn windows_install(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    request: WindowsInstallRequest,
+) -> Result<HelperResponse, String> {
+    let payload = json!({
+        "sourcePath": request.source_path,
+        "targetDevice": request.target_device,
+        "label": request.label,
+        "tpmBypass": request.tpm_bypass.unwrap_or(false),
+        "localAccount": request.local_account.unwrap_or(false),
+        "privacyDefaults": request.privacy_defaults.unwrap_or(false),
+    });
+
+    let response = run_helper_stream(
+        &app,
+        &window,
+        HelperRequest {
+            action: "windows_install".to_string(),
+            payload,
+        },
+    )?;
+
+    ok_or_message(response)
+}
+
+#[tauri::command]
+pub fn cancel_helper_operation() -> Result<(), String> {
+    if let Some(pid) = get_active_helper_pid() {
+        let output = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .output()
+            .map_err(|e| format!("Cancel failed: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("Cancel error: {stderr}"));
+        }
+        set_active_helper_pid(None);
+        return Ok(());
+    }
+
+    Err("No active operation to cancel".to_string())
+}
+
+#[tauri::command]
 pub fn preflight_partition(
     app: tauri::AppHandle,
     request: PreflightRequest,
@@ -1178,6 +1395,35 @@ pub fn get_partition_bounds(device_identifier: String) -> Result<PartitionBounds
     #[cfg(not(target_os = "macos"))]
     {
         Err("Partition bounds are only supported on macOS.".to_string())
+    }
+}
+
+#[tauri::command]
+pub fn eject_disk(device_identifier: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let device = if device_identifier.starts_with("/dev/") {
+            device_identifier
+        } else {
+            format!("/dev/{device_identifier}")
+        };
+
+        let output = Command::new("diskutil")
+            .args(["eject", &device])
+            .output()
+            .map_err(|e| format!("diskutil failed: {e}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("diskutil error: {stderr}"));
+        }
+
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("Eject not supported on this platform".to_string())
     }
 }
 

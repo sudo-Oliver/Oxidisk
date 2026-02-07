@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { sendNotification } from "@tauri-apps/plugin-notification";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   AppShell,
@@ -44,8 +45,20 @@ import {
   IconTrash,
   IconLock,
   IconDatabase,
+  IconBrandWindows,
 } from "@tabler/icons-react";
 import { ResponsiveSunburst } from "@nivo/sunburst";
+import {
+  SiUbuntu,
+  SiLinuxmint,
+  SiArchlinux,
+  SiApple,
+  SiFedora,
+  SiDebian,
+  SiOpensuse,
+  SiManjaro,
+  SiKalilinux,
+} from "react-icons/si";
 import "./App.css";
 
 // --- TYPEN ---
@@ -164,6 +177,50 @@ function formatDate(seconds: number) {
   return new Date(seconds * 1000).toLocaleString();
 }
 
+function truncateMiddle(value: string, maxLength: number) {
+  if (value.length <= maxLength) return value;
+  const keep = Math.max(4, Math.floor((maxLength - 3) / 2));
+  const start = value.slice(0, keep);
+  const end = value.slice(value.length - keep);
+  return `${start}...${end}`;
+}
+
+function formatEta(seconds: number | null) {
+  if (seconds == null || !Number.isFinite(seconds)) return "";
+  const total = Math.max(0, Math.round(seconds));
+  const mins = Math.floor(total / 60);
+  const secs = total % 60;
+  if (mins <= 0) return `${secs}s`;
+  return `${mins}m ${secs}s`;
+}
+
+function renderImageBrandIcon(brand: string | null) {
+  switch (brand) {
+    case "ubuntu":
+      return <SiUbuntu size={64} color="#E95420" />;
+    case "mint":
+      return <SiLinuxmint size={64} color="#87CF3E" />;
+    case "arch":
+      return <SiArchlinux size={64} color="#1793D1" />;
+    case "windows":
+      return <IconBrandWindows size={64} color="#3b82f6" />;
+    case "macos":
+      return <SiApple size={64} color="#6b7280" />;
+    case "fedora":
+      return <SiFedora size={64} color="#3c6df0" />;
+    case "debian":
+      return <SiDebian size={64} color="#D70A53" />;
+    case "opensuse":
+      return <SiOpensuse size={64} color="#73BA25" />;
+    case "manjaro":
+      return <SiManjaro size={64} color="#35BF5C" />;
+    case "kali":
+      return <SiKalilinux size={64} color="#268BEE" />;
+    default:
+      return null;
+  }
+}
+
 export default function App() {
   const [opened, { toggle }] = useDisclosure();
   const [activeView, setActiveView] = useState<"analyzer" | "partition" | "images">("analyzer");
@@ -213,13 +270,33 @@ export default function App() {
   const [apfsAddError, setApfsAddError] = useState<string | null>(null);
   const [apfsDeleteBusy, setApfsDeleteBusy] = useState<string | null>(null);
   const [imagePath, setImagePath] = useState<string | null>(null);
+  const [imageMode, setImageMode] = useState<"write" | "backup" | "windows">("write");
   const [imageTarget, setImageTarget] = useState<string>("");
   const [imageVerify, setImageVerify] = useState(true);
+  const [imageAutoEject, setImageAutoEject] = useState(true);
+  const [imageBackupPath, setImageBackupPath] = useState("");
+  const [imageBackupCompress, setImageBackupCompress] = useState(true);
   const [imageConfirmText, setImageConfirmText] = useState("");
   const [imageError, setImageError] = useState<string | null>(null);
   const [imageSuccess, setImageSuccess] = useState<string | null>(null);
   const [imageRunning, setImageRunning] = useState(false);
   const [showAllImageTargets, setShowAllImageTargets] = useState(false);
+  const [imageShowLog, setImageShowLog] = useState(false);
+  const [imageResultMount, setImageResultMount] = useState<string | null>(null);
+  const [imageHash, setImageHash] = useState<string | null>(null);
+  const [imageHashError, setImageHashError] = useState<string | null>(null);
+  const [imageHashRunning, setImageHashRunning] = useState(false);
+  const [imageWindowsDetected, setImageWindowsDetected] = useState(false);
+  const [imageWindowsReason, setImageWindowsReason] = useState<string | null>(null);
+  const [imageBrand, setImageBrand] = useState<string | null>(null);
+  const [imageLabel, setImageLabel] = useState<string | null>(null);
+  const [imageWindowsOverride, setImageWindowsOverride] = useState(false);
+  const [imageWindowsLabel, setImageWindowsLabel] = useState("WINSTALL");
+  const [imageWindowsSheetOpen, setImageWindowsSheetOpen] = useState(false);
+  const [imageWindowsSheetConfirmed, setImageWindowsSheetConfirmed] = useState(false);
+  const [imageWinTpmBypass, setImageWinTpmBypass] = useState(false);
+  const [imageWinLocalAccount, setImageWinLocalAccount] = useState(false);
+  const [imageWinPrivacyDefaults, setImageWinPrivacyDefaults] = useState(false);
   const [createWizardOpen, setCreateWizardOpen] = useState(false);
   const [createDevice, setCreateDevice] = useState<PartitionDevice | null>(null);
   const [createFormatType, setCreateFormatType] = useState("exfat");
@@ -268,6 +345,10 @@ export default function App() {
   const [progressMessage, setProgressMessage] = useState<string | null>(null);
   const [progressBytes, setProgressBytes] = useState<{ current: number; total: number } | null>(null);
   const [progressLog, setProgressLog] = useState<string[]>([]);
+  const [progressSpeed, setProgressSpeed] = useState<number | null>(null);
+  const [progressEta, setProgressEta] = useState<number | null>(null);
+  const lastProgressRef = useRef<{ time: number; bytes: number } | null>(null);
+  const imageRunningRef = useRef(false);
   const [clipboardPartition, setClipboardPartition] = useState<PartitionEntry | null>(null);
   const [clipboardFs, setClipboardFs] = useState<string | null>(null);
   const [pasteWizardOpen, setPasteWizardOpen] = useState(false);
@@ -558,9 +639,84 @@ export default function App() {
         setImagePath(selected);
         setImageError(null);
         setImageSuccess(null);
+        setImageHash(null);
+        setImageHashError(null);
+        setImageWindowsDetected(false);
+        setImageWindowsReason(null);
+        setImageBrand(null);
+        setImageLabel(null);
+        setImageWindowsOverride(false);
+        setImageWindowsSheetConfirmed(false);
+        try {
+          const result = await invoke<{
+            details?: {
+              isWindows?: boolean;
+              reason?: string | null;
+              brand?: string | null;
+              label?: string | null;
+            };
+          }>(
+            "inspect_image",
+            { sourcePath: selected }
+          );
+          const isWindows = !!result?.details?.isWindows;
+          const reason = result?.details?.reason ?? null;
+          const brand = result?.details?.brand ?? null;
+          const label = result?.details?.label ?? null;
+          setImageWindowsDetected(isWindows);
+          setImageWindowsReason(reason);
+          setImageBrand(brand);
+          setImageLabel(label);
+        } catch (error) {
+          setImageWindowsDetected(false);
+          setImageWindowsReason(null);
+          setImageBrand(null);
+          setImageLabel(null);
+        }
       }
     } catch (error) {
       setImageError(String(error));
+    }
+  }
+
+  function buildBackupName(deviceIdentifier: string, compress: boolean) {
+    const safe = deviceIdentifier.replace(/[^a-zA-Z0-9_-]/g, "-");
+    const suffix = compress ? ".img.gz" : ".img";
+    return `oxidisk-${safe}${suffix}`;
+  }
+
+  async function chooseBackupTarget() {
+    try {
+      const selected = await openDialog({ directory: true, multiple: false, title: "Zielordner waehlen" });
+      if (typeof selected === "string") {
+        const fileName = buildBackupName(imageTarget || "disk", imageBackupCompress);
+        const normalized = selected.endsWith("/") ? selected.slice(0, -1) : selected;
+        setImageBackupPath(`${normalized}/${fileName}`);
+        setImageError(null);
+      }
+    } catch (error) {
+      setImageError(String(error));
+    }
+  }
+
+  async function computeImageHash() {
+    if (!imagePath) return;
+    setImageHashRunning(true);
+    setImageHashError(null);
+    setProgressLog([]);
+    setProgressOpen(true);
+    setProgressMessage("Hashing image");
+    try {
+      const result = await invoke<{ details?: { sha256?: string } }>("hash_image", { sourcePath: imagePath });
+      setImageHash(result?.details?.sha256 ?? null);
+    } catch (error) {
+      setImageHashError(String(error));
+      setImageHash(null);
+    } finally {
+      setImageHashRunning(false);
+      setProgressOpen(false);
+      setProgressMessage(null);
+      setProgressBytes(null);
     }
   }
 
@@ -575,12 +731,24 @@ export default function App() {
   }
 
   async function submitFlashImage() {
+    if (imageMode === "backup") {
+      await submitBackupImage();
+      return;
+    }
+    if (imageMode === "windows") {
+      await submitWindowsInstall();
+      return;
+    }
     if (!imagePath) {
       setImageError("Bitte ein Image auswaehlen.");
       return;
     }
     if (!imageTarget) {
       setImageError("Bitte ein Zielgeraet auswaehlen.");
+      return;
+    }
+    if (imageWindowsDetected && !imageWindowsOverride) {
+      setImageError("Windows-ISO erkannt. Nutze spaeter den Windows-Installer-Modus.");
       return;
     }
     if (imageConfirmText.trim() !== imageTarget) {
@@ -594,6 +762,9 @@ export default function App() {
     setProgressLog([]);
     setProgressOpen(true);
     setProgressMessage("Starte Flash...");
+    setProgressSpeed(null);
+    setProgressEta(null);
+    lastProgressRef.current = null;
 
     try {
       const result = await invoke<{ details?: { sourceHash?: string; verifiedHash?: string } }>("flash_image", {
@@ -607,6 +778,15 @@ export default function App() {
         ? `Flash abgeschlossen. SHA-256: ${sourceHash}${verifiedHash ? " (verifiziert)" : ""}`
         : "Flash abgeschlossen.";
       setImageSuccess(message);
+      setImageResultMount(imageBackupPath.trim() || null);
+      sendNotification({ title: "Oxidisk", body: message });
+      if (imageAutoEject) {
+        try {
+          await invoke("eject_disk", { deviceIdentifier: imageTarget });
+        } catch (error) {
+          setImageError(String(error));
+        }
+      }
       setImageConfirmText("");
       await loadPartitionDevices();
     } catch (error) {
@@ -616,6 +796,128 @@ export default function App() {
       setProgressOpen(false);
       setProgressMessage(null);
       setProgressBytes(null);
+      setProgressSpeed(null);
+      setProgressEta(null);
+    }
+  }
+
+  async function submitBackupImage() {
+    if (!imageTarget) {
+      setImageError("Bitte ein Quellgeraet auswaehlen.");
+      return;
+    }
+    if (!imageBackupPath.trim()) {
+      setImageError("Bitte einen Zielpfad fuer das Backup angeben.");
+      return;
+    }
+    if (imageConfirmText.trim() !== imageTarget) {
+      setImageError("Bitte die Device-ID exakt eingeben.");
+      return;
+    }
+
+    setImageRunning(true);
+    setImageError(null);
+    setImageSuccess(null);
+    setProgressLog([]);
+    setProgressOpen(true);
+    setProgressMessage("Backup wird erstellt...");
+    setProgressSpeed(null);
+    setProgressEta(null);
+    lastProgressRef.current = null;
+
+    try {
+      await invoke("backup_image", {
+        sourceDevice: imageTarget,
+        targetPath: imageBackupPath.trim(),
+        compress: imageBackupCompress,
+      });
+      const message = "Backup abgeschlossen und verifiziert.";
+      setImageSuccess(message);
+      setImageResultMount(null);
+      sendNotification({ title: "Oxidisk", body: message });
+      if (imageAutoEject) {
+        try {
+          await invoke("eject_disk", { deviceIdentifier: imageTarget });
+        } catch (error) {
+          setImageError(String(error));
+        }
+      }
+      setImageConfirmText("");
+    } catch (error) {
+      setImageError(String(error));
+    } finally {
+      setImageRunning(false);
+      setProgressOpen(false);
+      setProgressMessage(null);
+      setProgressBytes(null);
+      setProgressSpeed(null);
+      setProgressEta(null);
+    }
+  }
+
+  async function submitWindowsInstall() {
+    if (!imagePath) {
+      setImageError("Bitte ein Windows-ISO auswaehlen.");
+      return;
+    }
+    if (!imageTarget) {
+      setImageError("Bitte ein Zielgeraet auswaehlen.");
+      return;
+    }
+    if (!imageWindowsDetected) {
+      setImageError("Keine Windows-ISO erkannt. Bitte eine Windows-ISO waehlen.");
+      return;
+    }
+    if (!imageWindowsSheetConfirmed) {
+      setImageWindowsSheetOpen(true);
+      return;
+    }
+    if (imageConfirmText.trim() !== imageTarget) {
+      setImageError("Bitte die Device-ID exakt eingeben.");
+      return;
+    }
+
+    setImageRunning(true);
+    setImageError(null);
+    setImageSuccess(null);
+    setProgressLog([]);
+    setProgressOpen(true);
+    setProgressMessage("Windows Installer wird erstellt...");
+    setProgressSpeed(null);
+    setProgressEta(null);
+    lastProgressRef.current = null;
+
+    try {
+      const result = await invoke<{ details?: { mountPoint?: string | null } }>("windows_install", {
+        sourcePath: imagePath,
+        targetDevice: imageTarget,
+        label: imageWindowsLabel.trim() || "WINSTALL",
+        tpmBypass: imageWinTpmBypass,
+        localAccount: imageWinLocalAccount,
+        privacyDefaults: imageWinPrivacyDefaults,
+      });
+      const message = "Windows-Installer abgeschlossen.";
+      setImageSuccess(message);
+      setImageResultMount(result?.details?.mountPoint ?? null);
+      sendNotification({ title: "Oxidisk", body: message });
+      if (imageAutoEject) {
+        try {
+          await invoke("eject_disk", { deviceIdentifier: imageTarget });
+        } catch (error) {
+          setImageError(String(error));
+        }
+      }
+      setImageConfirmText("");
+      await loadPartitionDevices();
+    } catch (error) {
+      setImageError(String(error));
+    } finally {
+      setImageRunning(false);
+      setProgressOpen(false);
+      setProgressMessage(null);
+      setProgressBytes(null);
+      setProgressSpeed(null);
+      setProgressEta(null);
     }
   }
 
@@ -1350,6 +1652,12 @@ export default function App() {
   }, [activeView]);
 
   useEffect(() => {
+    if (imageMode !== "windows") {
+      setImageWindowsSheetConfirmed(false);
+    }
+  }, [imageMode]);
+
+  useEffect(() => {
     let unlisten: (() => void) | null = null;
     listen<any>("partition-operation-progress", (event) => {
       const payload = event.payload as {
@@ -1363,8 +1671,27 @@ export default function App() {
       setProgressMessage(payload.message ?? payload.phase ?? null);
       if (payload.bytes !== undefined && payload.totalBytes !== undefined) {
         setProgressBytes({ current: payload.bytes, total: payload.totalBytes });
+        const now = Date.now();
+        const last = lastProgressRef.current;
+        if (last && payload.bytes >= last.bytes) {
+          const deltaBytes = payload.bytes - last.bytes;
+          const deltaTime = Math.max(0.001, (now - last.time) / 1000);
+          const speed = deltaBytes / deltaTime;
+          setProgressSpeed(speed);
+          if (payload.totalBytes > 0 && speed > 0) {
+            const remaining = payload.totalBytes - payload.bytes;
+            setProgressEta(remaining / speed);
+          } else {
+            setProgressEta(null);
+          }
+        }
+        lastProgressRef.current = { time: now, bytes: payload.bytes };
       }
-      setProgressOpen(true);
+      if (imageRunningRef.current) {
+        setProgressOpen(false);
+      } else {
+        setProgressOpen(true);
+      }
     }).then((fn) => {
       unlisten = fn;
     });
@@ -1636,8 +1963,57 @@ export default function App() {
       <Modal opened={!!imageSuccess} onClose={() => setImageSuccess(null)} title="Flash abgeschlossen" centered>
         <Stack gap="sm">
           <Text size="sm">{imageSuccess}</Text>
+          {imageResultMount && (
+            <Button
+              variant="light"
+              onClick={() => invoke("open_in_finder", { path: imageResultMount }).catch(() => {})}
+            >
+              Im Finder anzeigen
+            </Button>
+          )}
           <Group justify="flex-end" mt="md">
             <Button onClick={() => setImageSuccess(null)}>OK</Button>
+          </Group>
+        </Stack>
+      </Modal>
+      <Modal
+        opened={imageWindowsSheetOpen}
+        onClose={() => setImageWindowsSheetOpen(false)}
+        title="Windows Setup anpassen"
+        centered
+      >
+        <Stack gap="sm">
+          <Text size="sm" c="dimmed">
+            Diese Einstellungen erzeugen eine autounattend.xml auf dem Stick.
+          </Text>
+          <Switch
+            label="TPM 2.0 / Secure Boot umgehen"
+            checked={imageWinTpmBypass}
+            onChange={(event) => setImageWinTpmBypass(event.currentTarget.checked)}
+          />
+          <Switch
+            label="Lokalen Account erzwingen"
+            checked={imageWinLocalAccount}
+            onChange={(event) => setImageWinLocalAccount(event.currentTarget.checked)}
+          />
+          <Switch
+            label="Datenschutz-Einstellungen deaktivieren"
+            checked={imageWinPrivacyDefaults}
+            onChange={(event) => setImageWinPrivacyDefaults(event.currentTarget.checked)}
+          />
+          <Group justify="flex-end" mt="md">
+            <Button variant="default" onClick={() => setImageWindowsSheetOpen(false)}>
+              Abbrechen
+            </Button>
+            <Button
+              onClick={async () => {
+                setImageWindowsSheetOpen(false);
+                setImageWindowsSheetConfirmed(true);
+                await submitWindowsInstall();
+              }}
+            >
+              Fortfahren
+            </Button>
           </Group>
         </Stack>
       </Modal>
@@ -2782,7 +3158,7 @@ export default function App() {
                                 {part.identifier} {part.name ? `· ${part.name}` : ""}
                               </Text>
                               <Text size="xs" c="dimmed">
-                                {formatBytes(part.size)} · {part.content}
+                                {formatBytes(part.size)} · {part.fs_type ?? part.content}
                                 {part.mount_point ? ` · ${part.mount_point}` : ""}
                               </Text>
                               {part.is_protected && (
@@ -2892,104 +3268,373 @@ export default function App() {
         {activeView === "images" && (
           <Group h="100%" gap="md" align="stretch">
             <Paper withBorder p="md" radius="md" shadow="sm" style={{ flex: 2, display: "flex", flexDirection: "column", gap: 12 }}>
-              <Group justify="space-between" align="center">
-                <div>
-                  <Text c="dimmed" size="xs" tt="uppercase" fw={700}>
-                    Image Writer
-                  </Text>
-                  <Title order={3}>Flash Images auf USB/SD</Title>
-                  <Text size="sm" c="dimmed">
-                    Schreibe ISO/IMG/DMG direkt auf einen Stick. Optional mit SHA-256 Verifikation.
-                  </Text>
-                </div>
-                <Group gap="xs">
-                  <Button variant="light" onClick={loadPartitionDevices} leftSection={<IconRefresh size={18} />}
-                    >
-                    Neu laden
-                  </Button>
-                </Group>
-              </Group>
-              <Divider />
-
-              <Stack gap="md">
-                <Paper withBorder radius="md" p="md">
-                  <Stack gap="xs">
-                    <Text fw={600}>Quelle</Text>
-                    <Group gap="xs" align="center">
-                      <Button variant="light" onClick={chooseImageFile}>
-                        Image auswaehlen
-                      </Button>
-                      <Text size="sm" c={imagePath ? "" : "dimmed"}>
-                        {imagePath ?? "Keine Datei gewaehlt"}
-                      </Text>
-                    </Group>
-                  </Stack>
-                </Paper>
-
-                <Paper withBorder radius="md" p="md">
-                  <Stack gap="xs">
-                    <Group justify="space-between" align="center">
-                      <Text fw={600}>Zielgeraet</Text>
-                      <Switch
-                        label="Alle Laufwerke"
-                        checked={showAllImageTargets}
-                        onChange={(event) => setShowAllImageTargets(event.currentTarget.checked)}
-                      />
-                    </Group>
-                    <NativeSelect
-                      label="USB/SD Target"
-                      value={imageTarget}
-                      onChange={(event) => setImageTarget(event.currentTarget.value)}
-                      data={imageTargetOptions()}
-                      placeholder="Geraet waehlen"
-                    />
-                    {imageTargetOptions().length === 0 && (
-                      <Text size="xs" c="dimmed">
-                        Keine externen Laufwerke gefunden. Aktiviere "Alle Laufwerke" um interne Disks zu sehen.
-                      </Text>
-                    )}
-                  </Stack>
-                </Paper>
-
-                <Paper withBorder radius="md" p="md">
-                  <Stack gap="xs">
-                    <Text fw={600}>Einstellungen</Text>
-                    <Switch
-                      label="SHA-256 Verifikation"
-                      checked={imageVerify}
-                      onChange={(event) => setImageVerify(event.currentTarget.checked)}
-                    />
-                  </Stack>
-                </Paper>
-
-                <Paper withBorder radius="md" p="md">
-                  <Stack gap="xs">
-                    <Text fw={600}>Flash</Text>
-                    <TextInput
-                      label="Device-ID bestaetigen"
-                      value={imageConfirmText}
-                      onChange={(event) => setImageConfirmText(event.currentTarget.value)}
-                      placeholder={imageTarget || "diskX"}
-                      description="Gib die Device-ID exakt ein, um fortzufahren."
-                    />
-                    {imageError && (
-                      <Text size="sm" c="red">
-                        {imageError}
-                      </Text>
-                    )}
-                    <Group justify="flex-end" mt="sm">
-                      <Button
-                        color="red"
-                        onClick={submitFlashImage}
-                        loading={imageRunning}
-                        disabled={!imagePath || !imageTarget}
+              {imageRunning ? (
+                <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  <Paper
+                    withBorder
+                    radius="lg"
+                    p="xl"
+                    style={{
+                      width: "min(760px, 92%)",
+                      textAlign: "center",
+                      position: "relative",
+                      background: "var(--mantine-color-body)",
+                    }}
+                  >
+                    <Stack gap="md" align="center">
+                      <div className="pulse-icon">
+                        {(imageMode === "backup" ? null : renderImageBrandIcon(imageBrand)) ??
+                          (imageMode === "windows" || imageWindowsDetected ? (
+                            <IconBrandWindows size={64} color="#3b82f6" />
+                          ) : (
+                            <IconDeviceFloppy size={64} color="#f97316" />
+                          ))}
+                      </div>
+                      <div>
+                        <Text size="xs" c="dimmed" tt="uppercase" fw={700}>
+                          Image Writer aktiv
+                        </Text>
+                        <Title order={3} mt={4}>
+                          {imageTarget ? `Schreibe auf ${imageTarget}` : "Vorgang laeuft"}
+                        </Title>
+                        <Text size="sm" c="dimmed">
+                          {imagePath ? truncateMiddle(imagePath, 52) : ""}
+                        </Text>
+                        {imageMode !== "backup" && imageLabel && (
+                          <Text size="xs" c="dimmed">
+                            {truncateMiddle(imageLabel, 52)}
+                          </Text>
+                        )}
+                      </div>
+                      <Progress value={progressPercent} size="lg" radius="xl" />
+                      <Group justify="space-between" style={{ width: "100%" }}>
+                        <Text size="sm" c="dimmed">
+                          {(() => {
+                            if (!progressMessage) return "";
+                            const parts = progressMessage.split(" · ");
+                            const left = parts[0] ?? progressMessage;
+                            return truncateMiddle(left, 40);
+                          })()}
+                        </Text>
+                        <Text size="sm" c="dimmed" className="tabular-nums">
+                          {(() => {
+                            const speed =
+                              progressSpeed != null ? `${(progressSpeed / (1024 * 1024)).toFixed(1)} MB/s` : "";
+                            const eta = progressEta != null ? `· ${formatEta(progressEta)}` : "";
+                            if (speed || eta) return `${speed} ${eta}`.trim();
+                            if (!progressMessage) return "";
+                            const parts = progressMessage.split(" · ");
+                            return parts[1] ?? "";
+                          })()}
+                        </Text>
+                      </Group>
+                      <Group justify="space-between" style={{ width: "100%" }} mt="sm">
+                        <Button
+                          variant="outline"
+                          color="red"
+                          onClick={async () => {
+                            try {
+                              await invoke("cancel_helper_operation");
+                              setImageRunning(false);
+                              setProgressOpen(false);
+                              setProgressMessage(null);
+                              setProgressBytes(null);
+                              setProgressSpeed(null);
+                              setProgressEta(null);
+                            } catch (error) {
+                              setImageError(String(error));
+                            }
+                          }}
+                        >
+                          Abbrechen
+                        </Button>
+                        <Button
+                          variant="subtle"
+                          onClick={() => setImageShowLog((prev) => !prev)}
+                        >
+                          {imageShowLog ? "Log ausblenden" : "Log anzeigen"}
+                        </Button>
+                      </Group>
+                    </Stack>
+                    {imageShowLog && progressLog.length > 0 && (
+                      <Paper
+                        withBorder
+                        radius="md"
+                        p="sm"
+                        style={{
+                          position: "absolute",
+                          bottom: 16,
+                          left: "50%",
+                          transform: "translateX(-50%)",
+                          width: "min(720px, 92%)",
+                          maxHeight: 200,
+                          overflow: "auto",
+                          textAlign: "left",
+                        }}
                       >
-                        Flash starten
+                        <Text size="xs" style={{ whiteSpace: "pre-wrap", fontFamily: "ui-monospace" }}>
+                          {progressLog.join("\n")}
+                        </Text>
+                      </Paper>
+                    )}
+                  </Paper>
+                </div>
+              ) : (
+                <>
+                  <Group justify="space-between" align="center">
+                    <div>
+                      <Text c="dimmed" size="xs" tt="uppercase" fw={700}>
+                        Image Writer
+                      </Text>
+                      <Title order={3}>Flash Images auf USB/SD</Title>
+                      <Text size="sm" c="dimmed">
+                        Schreibe ISO/IMG/DMG direkt auf einen Stick. Optional mit SHA-256 Verifikation.
+                      </Text>
+                    </div>
+                    <Group gap="xs">
+                      <Button variant="light" onClick={loadPartitionDevices} leftSection={<IconRefresh size={18} />}>
+                        Neu laden
                       </Button>
                     </Group>
+                  </Group>
+                  <Divider />
+                </>
+              )}
+
+              {!imageRunning && (
+                <>
+                  <Group justify="space-between" align="center">
+                    <Text fw={600}>Modus</Text>
+                    <NativeSelect
+                      value={imageMode}
+                      onChange={(event) => setImageMode(event.currentTarget.value as "write" | "backup" | "windows")}
+                      data={[
+                        { value: "write", label: "Schreiben (Image -> Stick)" },
+                        { value: "backup", label: "Backup erstellen (Stick -> Image)" },
+                        { value: "windows", label: "Windows Installer (File Copy)" },
+                      ]}
+                    />
+                  </Group>
+
+                  <Stack gap="md">
+                    <Paper withBorder radius="md" p="md">
+                      <Stack gap="xs">
+                        <Text fw={600}>Quelle</Text>
+                        {imageMode === "write" ? (
+                          <Stack gap="xs">
+                            <Group gap="xs" align="center">
+                              <Button variant="light" onClick={chooseImageFile}>
+                                Image auswaehlen
+                              </Button>
+                              <Text size="sm" c={imagePath ? "" : "dimmed"}>
+                                {imagePath ?? "Keine Datei gewaehlt"}
+                              </Text>
+                            </Group>
+                            <Group gap="xs" align="center">
+                              <Button
+                                variant="subtle"
+                                onClick={computeImageHash}
+                                disabled={!imagePath}
+                                loading={imageHashRunning}
+                              >
+                                SHA-256 berechnen
+                              </Button>
+                              {imageHash && (
+                                <Text size="xs" c="dimmed">
+                                  {imageHash}
+                                </Text>
+                              )}
+                              {imageHashError && (
+                                <Text size="xs" c="red">
+                                  {imageHashError}
+                                </Text>
+                              )}
+                            </Group>
+                            {imageWindowsDetected && (
+                              <Stack gap={4}>
+                                <Text size="sm" c="red">
+                                  Achtung: Windows-ISO erkannt. Der Windows-Installer-Modus ist in Arbeit.
+                                </Text>
+                                {imageWindowsReason && (
+                                  <Text size="xs" c="dimmed">
+                                    Hinweis: {imageWindowsReason}
+                                  </Text>
+                                )}
+                                <Switch
+                                  label="Trotzdem flashen (nur Daten-Stick)"
+                                  checked={imageWindowsOverride}
+                                  onChange={(event) => setImageWindowsOverride(event.currentTarget.checked)}
+                                />
+                              </Stack>
+                            )}
+                          </Stack>
+                        ) : imageMode === "windows" ? (
+                          <Stack gap="xs">
+                            <Group gap="xs" align="center">
+                              <Button variant="light" onClick={chooseImageFile}>
+                                Windows-ISO auswaehlen
+                              </Button>
+                              <Text size="sm" c={imagePath ? "" : "dimmed"}>
+                                {imagePath ?? "Keine Datei gewaehlt"}
+                              </Text>
+                            </Group>
+                            {imageWindowsDetected ? (
+                              <Text size="sm" c="dimmed">
+                                Windows-ISO erkannt. Installer wird per Datei-Kopie erstellt.
+                              </Text>
+                            ) : (
+                              <Text size="sm" c="red">
+                                Keine Windows-ISO erkannt.
+                              </Text>
+                            )}
+                            {imageWindowsReason && (
+                              <Text size="xs" c="dimmed">
+                                Hinweis: {imageWindowsReason}
+                              </Text>
+                            )}
+                          </Stack>
+                        ) : (
+                          <Text size="sm" c="dimmed">
+                            Quelle ist das ausgewaehlte Geraet im Zielbereich.
+                          </Text>
+                        )}
+                      </Stack>
+                    </Paper>
+
+                    <Paper withBorder radius="md" p="md">
+                      <Stack gap="xs">
+                        <Group justify="space-between" align="center">
+                          <Text fw={600}>{imageMode === "write" ? "Zielgeraet" : "Quellgeraet"}</Text>
+                          <Switch
+                            label="Alle Laufwerke"
+                            checked={showAllImageTargets}
+                            onChange={(event) => setShowAllImageTargets(event.currentTarget.checked)}
+                          />
+                        </Group>
+                        <NativeSelect
+                          label={imageMode === "write" ? "USB/SD Target" : "USB/SD Quelle"}
+                          value={imageTarget}
+                          onChange={(event) => setImageTarget(event.currentTarget.value)}
+                          data={imageTargetOptions()}
+                          placeholder="Geraet waehlen"
+                        />
+                        {imageTargetOptions().length === 0 && (
+                          <Text size="xs" c="dimmed">
+                            Keine externen Laufwerke gefunden. Aktiviere "Alle Laufwerke" um interne Disks zu sehen.
+                          </Text>
+                        )}
+                      </Stack>
+                    </Paper>
+
+                    <Paper withBorder radius="md" p="md">
+                      <Stack gap="xs">
+                        <Text fw={600}>Einstellungen</Text>
+                        {imageMode === "write" ? (
+                          <Switch
+                            label="SHA-256 Verifikation"
+                            checked={imageVerify}
+                            onChange={(event) => setImageVerify(event.currentTarget.checked)}
+                          />
+                        ) : imageMode === "backup" ? (
+                          <Switch
+                            label="Backup komprimieren (.img.gz)"
+                            checked={imageBackupCompress}
+                            onChange={(event) => setImageBackupCompress(event.currentTarget.checked)}
+                          />
+                        ) : (
+                          <Text size="sm" c="dimmed">
+                            Zielstick wird als GPT + ExFAT vorbereitet (UEFI kompatibel).
+                          </Text>
+                        )}
+                        <Switch
+                          label="Nach Erfolg sicher auswerfen"
+                          checked={imageAutoEject}
+                          onChange={(event) => setImageAutoEject(event.currentTarget.checked)}
+                        />
+                      </Stack>
+                    </Paper>
+
+                    {imageMode === "backup" && (
+                      <Paper withBorder radius="md" p="md">
+                        <Stack gap="xs">
+                          <Text fw={600}>Zielpfad</Text>
+                          <Group gap="xs" align="center">
+                            <Button variant="light" onClick={chooseBackupTarget} disabled={!imageTarget}>
+                              Zielordner waehlen
+                            </Button>
+                            <Text size="xs" c="dimmed">
+                              {imageTarget ? "Pfad wird aus Ordner + Dateiname gebaut" : "Geraet zuerst waehlen"}
+                            </Text>
+                          </Group>
+                          <TextInput
+                            label="Dateipfad"
+                            value={imageBackupPath}
+                            onChange={(event) => setImageBackupPath(event.currentTarget.value)}
+                            placeholder="/Users/you/Desktop/oxidisk-diskX.img"
+                          />
+                        </Stack>
+                      </Paper>
+                    )}
+
+                    {imageMode === "windows" && (
+                      <Paper withBorder radius="md" p="md">
+                        <Stack gap="xs">
+                          <Text fw={600}>Label</Text>
+                          <TextInput
+                            label="Volume-Label"
+                            value={imageWindowsLabel}
+                            onChange={(event) => setImageWindowsLabel(event.currentTarget.value)}
+                            placeholder="WINSTALL"
+                          />
+                          <Text size="xs" c="dimmed">
+                            ExFAT ist Standard fuer Windows-ISOs. FAT32-Fallback (zwei Partitionen) ist fuer Advanced Users geplant.
+                          </Text>
+                        </Stack>
+                      </Paper>
+                    )}
+
+                    <Paper withBorder radius="md" p="md">
+                      <Stack gap="xs">
+                        <Text fw={600}>
+                          {imageMode === "write" ? "Flash" : imageMode === "backup" ? "Backup" : "Windows Installer"}
+                        </Text>
+                        <TextInput
+                          label="Device-ID bestaetigen"
+                          value={imageConfirmText}
+                          onChange={(event) => setImageConfirmText(event.currentTarget.value)}
+                          placeholder={imageTarget || "diskX"}
+                          description="Gib die Device-ID exakt ein, um fortzufahren."
+                        />
+                        {imageError && (
+                          <Text size="sm" c="red">
+                            {imageError}
+                          </Text>
+                        )}
+                        <Group justify="flex-end" mt="sm">
+                          <Button
+                            color="red"
+                            onClick={submitFlashImage}
+                            loading={imageRunning}
+                            disabled={
+                              imageMode === "write"
+                                ? !imagePath || !imageTarget
+                                : imageMode === "backup"
+                                  ? !imageTarget
+                                  : !imagePath || !imageTarget || !imageWindowsDetected
+                            }
+                          >
+                            {imageMode === "write"
+                              ? "Flash starten"
+                              : imageMode === "backup"
+                                ? "Backup starten"
+                                : "Windows-Installer erstellen"}
+                          </Button>
+                        </Group>
+                      </Stack>
+                    </Paper>
                   </Stack>
-                </Paper>
-              </Stack>
+                </>
+              )}
             </Paper>
           </Group>
         )}
