@@ -8,6 +8,8 @@ use std::path::Path;
 use std::time::UNIX_EPOCH;
 use sysinfo::Disks;
 
+mod partitioning;
+
 // --- DATENMODELLE ---
 
 #[derive(Serialize)]
@@ -345,7 +347,28 @@ fn format_bytes(bytes: u64) -> String {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![get_disks, scan_directory, open_in_finder, move_to_trash])
+        .invoke_handler(tauri::generate_handler![
+            get_disks,
+            scan_directory,
+            open_in_finder,
+            move_to_trash,
+            partitioning::get_partition_devices,
+            partitioning::wipe_device,
+            partitioning::create_partition_table,
+            partitioning::create_partition,
+            partitioning::delete_partition,
+            partitioning::format_partition,
+            partitioning::set_label_uuid,
+            partitioning::install_sudoers_helper,
+            partitioning::mount_disk,
+            partitioning::mount_volume,
+            partitioning::check_partition,
+            partitioning::resize_partition,
+            partitioning::move_partition,
+            partitioning::copy_partition,
+            partitioning::get_sidecar_status,
+            partitioning::get_partition_bounds,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
