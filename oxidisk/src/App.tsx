@@ -48,6 +48,8 @@ import {
   IconLock,
   IconDatabase,
   IconBrandWindows,
+  IconChevronDown,
+  IconChevronUp,
 } from "@tabler/icons-react";
 import { ResponsiveSunburst } from "@nivo/sunburst";
 import {
@@ -99,8 +101,11 @@ interface PartitionDevice {
   identifier: string;
   size: number;
   internal: boolean;
+  is_solid_state?: boolean | null;
+  bus_protocol?: string | null;
   content: string;
   parent_device?: string | null;
+  is_virtual?: boolean | null;
   partitions: PartitionEntry[];
   is_protected: boolean;
   protection_reason?: string | null;
@@ -152,6 +157,10 @@ interface ApfsVolumeInfo {
   identifier: string;
   name: string;
   roles: string[];
+  volumeGroupUuid?: string | null;
+  volumeGroupRole?: string | null;
+  volumeGroupName?: string | null;
+  sealed?: boolean | null;
   size: number;
   used: number;
   mountPoint?: string | null;
@@ -219,11 +228,12 @@ type PartitionSegment = {
   size: number;
   offset: number;
   fsType: string;
-  kind: "partition" | "unallocated";
+  kind: "partition" | "unallocated" | "apfs-volume" | "apfs-hidden";
   partition?: PartitionEntry;
+  volume?: ApfsVolumeInfo;
 };
 
-function fsColorForSegment(fsType: string, kind: "partition" | "unallocated") {
+function fsColorForSegment(fsType: string, kind: PartitionSegment["kind"]) {
   if (kind === "unallocated") return "var(--oxidisk-unallocated)";
   switch (fsType) {
     case "apfs":
@@ -249,8 +259,9 @@ function fsColorForSegment(fsType: string, kind: "partition" | "unallocated") {
   }
 }
 
-function fsLabelForType(fsType: string, kind: "partition" | "unallocated") {
+function fsLabelForType(fsType: string, kind: PartitionSegment["kind"]) {
   if (kind === "unallocated") return "Unallocated";
+  if (kind === "apfs-volume") return "APFS Volume";
   switch (fsType) {
     case "apfs":
       return "APFS";
@@ -332,6 +343,106 @@ function buildPartitionSegments(device: PartitionDevice | null): PartitionSegmen
   return segments;
 }
 
+function isApfsContainerPartition(partition: PartitionEntry | null) {
+  if (!partition) return false;
+  const content = (partition.content ?? "").toLowerCase();
+  const fsType = (partition.fs_type ?? "").toLowerCase();
+  return (
+    content.includes("apple_apfs_container") ||
+    content.includes("apfs_container") ||
+    (content.includes("apfs") && content.includes("container")) ||
+    fsType.includes("apfs_container")
+  );
+}
+
+function buildApfsVolumeSegments(container: ApfsContainerInfo | null, showAll: boolean): PartitionSegment[] {
+  if (!container) return [];
+  const segments: PartitionSegment[] = [];
+  let cursor = 0;
+  const hiddenRoles = new Set(["VM", "Preboot", "Recovery", "Update"]);
+
+  for (const volume of container.volumes) {
+    const size = volume.size ?? volume.used ?? 0;
+    const isHidden = !showAll && volume.roles.some((role) => hiddenRoles.has(role));
+    segments.push({
+      key: `apfs-${volume.identifier}`,
+      label: isHidden ? "System Volume" : volume.name || volume.identifier,
+      size,
+      offset: cursor,
+      fsType: "apfs",
+      kind: isHidden ? "apfs-hidden" : "apfs-volume",
+      volume: isHidden ? undefined : volume,
+    });
+    cursor += size;
+  }
+
+  const capacity = container.capacity ?? null;
+  const free = container.capacityFree ?? (capacity != null ? Math.max(0, capacity - cursor) : null);
+  if (free != null && free > 0) {
+    segments.push({
+      key: `unallocated-${cursor}`,
+      label: "Unallocated",
+      size: free,
+      offset: cursor,
+      fsType: "unallocated",
+      kind: "unallocated",
+    });
+  }
+
+  return segments;
+}
+
+type ApfsGroupBand = {
+  key: string;
+  label: string;
+  size: number;
+};
+
+function buildApfsGroupBands(segments: PartitionSegment[]): ApfsGroupBand[] {
+  const bands: ApfsGroupBand[] = [];
+  let lastKey: string | null = null;
+
+  for (const segment of segments) {
+    if (segment.kind !== "apfs-volume" || !segment.volume) continue;
+    const volume = segment.volume;
+    const groupKey = volume.volumeGroupUuid || volume.volumeGroupName || `solo-${volume.identifier}`;
+    const label = volume.volumeGroupName || (volume.volumeGroupUuid ? "Volume Group" : volume.name || volume.identifier);
+
+    if (groupKey === lastKey && bands.length > 0) {
+      bands[bands.length - 1].size += segment.size;
+    } else {
+      bands.push({ key: groupKey, label, size: segment.size });
+      lastKey = groupKey;
+    }
+  }
+
+  return bands;
+}
+
+function systemPartitionWarning(partition: PartitionEntry | null) {
+  if (!partition) return null;
+  if (partition.is_protected) {
+    return partition.protection_reason ?? "Systempartition erkannt. Aenderungen sind gesperrt.";
+  }
+  const content = (partition.content ?? "").toLowerCase();
+  const isSystemType =
+    content.includes("efi") ||
+    content.includes("recovery") ||
+    content.includes("apple_apfs_recovery") ||
+    content.includes("apple_apfs_isc") ||
+    content.includes("apple_boot");
+  return isSystemType ? "Systempartition erkannt. Aenderungen sind gesperrt." : null;
+}
+
+function partitionManagerDevices(devices: PartitionDevice[], showVirtual: boolean) {
+  return devices.filter((device) => {
+    const content = device.content.toLowerCase();
+    if (!showVirtual && content.includes("apple_apfs_container")) return false;
+    if (!showVirtual && device.is_virtual) return false;
+    return true;
+  });
+}
+
 function renderImageBrandIcon(brand: string | null) {
   switch (brand) {
     case "ubuntu":
@@ -365,14 +476,26 @@ export default function App() {
   const [disks, setDisks] = useState<SystemDisk[]>([]);
   const [scanData, setScanData] = useState<FileNode | null>(null);
   const [loading, setLoading] = useState(false);
-  const [showPowerDataInspector, setShowPowerDataInspector] = useState(true);
+  const [showPowerDataInspector, setShowPowerDataInspector] = useState(false);
+  const [showVirtualDisks, setShowVirtualDisks] = useState(false);
   const [showSystemVolumes, setShowSystemVolumes] = useState(false);
   const [partitionDevices, setPartitionDevices] = useState<PartitionDevice[]>([]);
   const [partitionLoading, setPartitionLoading] = useState(false);
   const [selectedPartitionDeviceId, setSelectedPartitionDeviceId] = useState<string | null>(null);
   const [selectedPartitionId, setSelectedPartitionId] = useState<string | null>(null);
   const [selectedUnallocated, setSelectedUnallocated] = useState<{ offset: number; size: number } | null>(null);
-  const [partitionBarWidth, setPartitionBarWidth] = useState(0);
+  const [selectedApfsVolumeId, setSelectedApfsVolumeId] = useState<string | null>(null);
+  const [apfsZoomContainerId, setApfsZoomContainerId] = useState<string | null>(null);
+  const [apfsZoomContainer, setApfsZoomContainer] = useState<ApfsContainerInfo | null>(null);
+  const [apfsZoomLoading, setApfsZoomLoading] = useState(false);
+  const [apfsZoomError, setApfsZoomError] = useState<string | null>(null);
+  const [expandedPartitionKey, setExpandedPartitionKey] = useState<string | null>(null);
+  const [systemUnlockOpen, setSystemUnlockOpen] = useState(false);
+  const [systemUnlockPassword, setSystemUnlockPassword] = useState("");
+  const [systemUnlockError, setSystemUnlockError] = useState<string | null>(null);
+  const [systemUnlockSubmitting, setSystemUnlockSubmitting] = useState(false);
+  const [systemUnlockActionLabel, setSystemUnlockActionLabel] = useState<string | null>(null);
+  const systemUnlockActionRef = useRef<(() => void) | null>(null);
   const [preflightResult, setPreflightResult] = useState<PreflightResult | null>(null);
   const [preflightKey, setPreflightKey] = useState<string | null>(null);
   const [preflightRunning, setPreflightRunning] = useState(false);
@@ -388,6 +511,14 @@ export default function App() {
   const [wipeError, setWipeError] = useState<string | null>(null);
   const [wipeSubmitting, setWipeSubmitting] = useState(false);
   const [wipeSuccess, setWipeSuccess] = useState<string | null>(null);
+  const [secureEraseOpen, setSecureEraseOpen] = useState(false);
+  const [secureEraseDevice, setSecureEraseDevice] = useState<PartitionDevice | null>(null);
+  const [secureEraseLevel, setSecureEraseLevel] = useState("0");
+  const [secureEraseConfirm, setSecureEraseConfirm] = useState("");
+  const [secureErasePassword, setSecureErasePassword] = useState("");
+  const [secureEraseError, setSecureEraseError] = useState<string | null>(null);
+  const [secureEraseSubmitting, setSecureEraseSubmitting] = useState(false);
+  const [secureEraseSuccess, setSecureEraseSuccess] = useState<string | null>(null);
   const [formatWizardOpen, setFormatWizardOpen] = useState(false);
   const [selectedPartition, setSelectedPartition] = useState<PartitionEntry | null>(null);
   const [formatType, setFormatType] = useState("exfat");
@@ -492,7 +623,6 @@ export default function App() {
   const [progressEta, setProgressEta] = useState<number | null>(null);
   const lastProgressRef = useRef<{ time: number; bytes: number } | null>(null);
   const imageRunningRef = useRef(false);
-  const partitionBarRef = useRef<HTMLDivElement | null>(null);
   const [clipboardPartition, setClipboardPartition] = useState<PartitionEntry | null>(null);
   const [clipboardFs, setClipboardFs] = useState<string | null>(null);
   const [pasteWizardOpen, setPasteWizardOpen] = useState(false);
@@ -561,6 +691,50 @@ export default function App() {
       deviceIdentifier: device.identifier,
       formatType: "exfat",
     });
+  }
+
+  function openSecureEraseWizard(device: PartitionDevice) {
+    setSecureEraseDevice(device);
+    setSecureEraseLevel("0");
+    setSecureEraseConfirm("");
+    setSecureErasePassword("");
+    setSecureEraseError(null);
+    setSecureEraseSuccess(null);
+    setSecureEraseOpen(true);
+  }
+
+  async function submitSecureErase() {
+    if (!secureEraseDevice) return;
+    if (secureEraseConfirm.trim() !== secureEraseDevice.identifier) {
+      setSecureEraseError("Device-ID stimmt nicht.");
+      return;
+    }
+    if (!secureErasePassword.trim()) {
+      setSecureEraseError("Bitte Admin-Passwort eingeben.");
+      return;
+    }
+
+    setSecureEraseSubmitting(true);
+    setSecureEraseError(null);
+    try {
+      const ok = await invoke<boolean>("validate_admin_password", { password: secureErasePassword });
+      if (!ok) {
+        setSecureEraseError("Passwort falsch oder nicht berechtigt.");
+        return;
+      }
+
+      await invoke("secure_erase", {
+        deviceIdentifier: secureEraseDevice.identifier,
+        level: Number(secureEraseLevel),
+      });
+      setSecureEraseSuccess("Sicheres Loeschen gestartet.");
+      setSecureEraseOpen(false);
+    } catch (error) {
+      setSecureEraseError(String(error));
+    } finally {
+      setSecureEraseSubmitting(false);
+      setSecureErasePassword("");
+    }
   }
 
   function supportsAutoMount(formatType: string) {
@@ -692,6 +866,60 @@ export default function App() {
     return volume.roles.some((role) => apfsProtectedRoles.has(role));
   }
 
+  function apfsVolumeWarning(volume: ApfsVolumeInfo | null) {
+    if (!volume) return null;
+    if (!apfsVolumeProtected(volume)) return null;
+    if (volume.roles.length > 0) {
+      return `APFS Rolle geschuetzt: ${volume.roles.join(", ")}`;
+    }
+    return "APFS System-Volume erkannt. Aenderungen sind gesperrt.";
+  }
+
+  function togglePartitionDetails(key: string) {
+    setExpandedPartitionKey((current) => (current === key ? null : key));
+  }
+
+  function requestSystemUnlock(actionLabel: string, action: () => void) {
+    if (!selectionLocked) {
+      action();
+      return;
+    }
+    systemUnlockActionRef.current = action;
+    setSystemUnlockActionLabel(actionLabel);
+    setSystemUnlockPassword("");
+    setSystemUnlockError(null);
+    setSystemUnlockOpen(true);
+  }
+
+  async function confirmSystemUnlock() {
+    if (!selectionLocked) {
+      setSystemUnlockOpen(false);
+      return;
+    }
+    if (!systemUnlockPassword.trim()) {
+      setSystemUnlockError("Bitte Admin-Passwort eingeben.");
+      return;
+    }
+    setSystemUnlockSubmitting(true);
+    setSystemUnlockError(null);
+    try {
+      const ok = await invoke<boolean>("validate_admin_password", { password: systemUnlockPassword });
+      if (!ok) {
+        setSystemUnlockError("Passwort falsch oder nicht berechtigt.");
+        return;
+      }
+      const action = systemUnlockActionRef.current;
+      systemUnlockActionRef.current = null;
+      setSystemUnlockOpen(false);
+      setSystemUnlockPassword("");
+      action?.();
+    } catch (error) {
+      setSystemUnlockError(String(error));
+    } finally {
+      setSystemUnlockSubmitting(false);
+    }
+  }
+
   async function loadApfsContainer(containerIdentifier: string) {
     setApfsLoading(true);
     setApfsError(null);
@@ -703,6 +931,31 @@ export default function App() {
     } finally {
       setApfsLoading(false);
     }
+  }
+
+  async function loadApfsZoomContainer(containerIdentifier: string) {
+    setApfsZoomLoading(true);
+    setApfsZoomError(null);
+    try {
+      const result = await invoke<ApfsContainerInfo>("apfs_list_volumes", { containerIdentifier });
+      setApfsZoomContainer(result);
+      setApfsZoomContainerId(containerIdentifier);
+      setSelectedPartitionId(null);
+      setSelectedPartition(null);
+      setSelectedUnallocated(null);
+      setSelectedApfsVolumeId(result.volumes[0]?.identifier ?? null);
+    } catch (error) {
+      setApfsZoomError(String(error));
+    } finally {
+      setApfsZoomLoading(false);
+    }
+  }
+
+  function resetApfsZoom() {
+    setApfsZoomContainerId(null);
+    setApfsZoomContainer(null);
+    setApfsZoomError(null);
+    setSelectedApfsVolumeId(null);
   }
 
   function openApfsManager(partition: PartitionEntry) {
@@ -1838,26 +2091,37 @@ export default function App() {
   }, [activeView]);
 
   useEffect(() => {
-    if (partitionDevices.length === 0) {
+    if (activeView !== "partition") return;
+    const devices = partitionManagerDevices(partitionDevices, showVirtualDisks);
+    if (devices.length === 0) {
       setSelectedPartitionDeviceId(null);
       setSelectedPartitionId(null);
       setSelectedPartition(null);
       setSelectedUnallocated(null);
+      setSelectedApfsVolumeId(null);
+      setExpandedPartitionKey(null);
+      resetApfsZoom();
       return;
     }
 
-    if (!selectedPartitionDeviceId || !partitionDevices.some((dev) => dev.identifier === selectedPartitionDeviceId)) {
-      const initial = partitionDevices[0];
+    if (!selectedPartitionDeviceId || !devices.some((dev) => dev.identifier === selectedPartitionDeviceId)) {
+      const initial = devices[0];
       setSelectedPartitionDeviceId(initial.identifier);
       setSelectedPartitionId(initial.partitions[0]?.identifier ?? null);
       setSelectedPartition(initial.partitions[0] ?? null);
       setSelectedUnallocated(null);
+      setSelectedApfsVolumeId(null);
+      setExpandedPartitionKey(null);
+      resetApfsZoom();
     }
-  }, [partitionDevices, selectedPartitionDeviceId]);
+  }, [activeView, partitionDevices, selectedPartitionDeviceId, showVirtualDisks]);
 
   useEffect(() => {
+    if (activeView !== "partition") return;
     if (!selectedPartitionDeviceId) return;
-    const device = partitionDevices.find((dev) => dev.identifier === selectedPartitionDeviceId);
+    const device = partitionManagerDevices(partitionDevices, showVirtualDisks).find(
+      (dev) => dev.identifier === selectedPartitionDeviceId
+    );
     if (!device) return;
     if (selectedPartitionId && device.partitions.some((part) => part.identifier === selectedPartitionId)) {
       setSelectedPartition(device.partitions.find((part) => part.identifier === selectedPartitionId) ?? null);
@@ -1866,24 +2130,22 @@ export default function App() {
     setSelectedPartitionId(device.partitions[0]?.identifier ?? null);
     setSelectedPartition(device.partitions[0] ?? null);
     setSelectedUnallocated(null);
-  }, [partitionDevices, selectedPartitionDeviceId, selectedPartitionId]);
+    setSelectedApfsVolumeId(null);
+    setExpandedPartitionKey(null);
+    resetApfsZoom();
+  }, [partitionDevices, selectedPartitionDeviceId, selectedPartitionId, showVirtualDisks]);
+
+  useEffect(() => {
+    if (!showPowerDataInspector) {
+      setExpandedPartitionKey(null);
+    }
+  }, [showPowerDataInspector]);
 
   useEffect(() => {
     if (imageMode !== "windows") {
       setImageWindowsSheetConfirmed(false);
     }
   }, [imageMode]);
-
-  useEffect(() => {
-    const node = partitionBarRef.current;
-    if (!node) return;
-    const update = () => setPartitionBarWidth(node.clientWidth);
-    update();
-
-    const observer = new ResizeObserver(() => update());
-    observer.observe(node);
-    return () => observer.disconnect();
-  }, [selectedPartitionDeviceId]);
 
   useEffect(() => {
     let unlisten: (() => void) | null = null;
@@ -2070,7 +2332,38 @@ export default function App() {
   const selectedPartitionDevice = selectedPartitionDeviceId
     ? partitionDevices.find((device) => device.identifier === selectedPartitionDeviceId) ?? null
     : null;
-  const partitionSegments = buildPartitionSegments(selectedPartitionDevice);
+  const selectedApfsVolume = apfsZoomContainer?.volumes.find((volume) => volume.identifier === selectedApfsVolumeId) ?? null;
+  const partitionSegments = apfsZoomContainer
+    ? buildApfsVolumeSegments(apfsZoomContainer, showPowerDataInspector)
+    : buildPartitionSegments(selectedPartitionDevice);
+  const apfsGroupBands = apfsZoomContainer ? buildApfsGroupBands(partitionSegments) : [];
+  const showApfsGroupBand =
+    !!apfsZoomContainer &&
+    partitionSegments.some(
+      (segment) =>
+        segment.kind === "apfs-volume" &&
+        !!(segment.volume?.volumeGroupUuid || segment.volume?.volumeGroupName)
+    ) &&
+    apfsGroupBands.length > 0;
+  const zoomedContainerLabel = apfsZoomContainerId ? `Container ${apfsZoomContainerId}` : null;
+  const isApfsZoomed = !!apfsZoomContainerId;
+  const selectedPartitionWarning = systemPartitionWarning(selectedPartition);
+  const selectedApfsVolumeWarning = apfsVolumeWarning(selectedApfsVolume);
+  const selectionLocked = !!selectedPartitionWarning || !!selectedApfsVolumeWarning;
+  const secureEraseIsInternalSsd = !!(secureEraseDevice?.internal && secureEraseDevice?.is_solid_state);
+  const secureEraseBus = secureEraseDevice?.bus_protocol ?? "";
+  const selectionDetails = selectedPartition
+    ? `${selectedPartition.identifier} · ${formatBytes(selectedPartition.size)} · ${
+        selectedPartition.content ||
+        fsLabelForType(fsTypeFromPartition(selectedPartition), "partition")
+      }`
+    : selectedApfsVolume
+      ? `${selectedApfsVolume.name || selectedApfsVolume.identifier} · ${formatBytes(
+          selectedApfsVolume.size
+        )} · APFS Volume`
+      : selectedUnallocated
+        ? `Unallocated · ${formatBytes(selectedUnallocated.size)}`
+        : "-";
 
   return (
     <AppShell
@@ -2181,6 +2474,123 @@ export default function App() {
               )}
             >
               Geraet loeschen
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
+      <Modal
+        opened={secureEraseOpen}
+        onClose={() => setSecureEraseOpen(false)}
+        title="Festplatte sicher loeschen"
+        centered
+      >
+        <Stack gap="sm">
+          <Text size="sm">
+            Achtung: Dieser Vorgang kann nicht rueckgaengig gemacht werden. Alle Daten auf dem Geraet werden zerstoert.
+          </Text>
+          {secureEraseIsInternalSsd ? (
+            <Text size="sm" c="dimmed">
+              Oxidisk hat eine interne SSD erkannt{secureEraseBus ? ` (${secureEraseBus})` : ""}. Empfohlen wird ein
+              kryptographisches Loeschen (Schluesselvernichtung), das sicherer und schneller ist als Ueberschreiben.
+            </Text>
+          ) : (
+            <Text size="sm" c="dimmed">
+              Waehle die Sicherheitsstufe fuers Ueberschreiben. Hoehere Stufen sind langsamer und nur fuer HDDs sinnvoll.
+            </Text>
+          )}
+          <Text size="sm">
+            Geraet: <b>{secureEraseDevice?.identifier ?? "-"}</b>
+          </Text>
+          {!secureEraseIsInternalSsd && (
+            <NativeSelect
+              label="Sicherheitsstufe"
+              value={secureEraseLevel}
+              onChange={(event) => setSecureEraseLevel(event.currentTarget.value)}
+              data={[
+                { value: "0", label: "Stufe 0 (Schnell, Nullen)" },
+                { value: "1", label: "Stufe 1 (Zufall, 2 Durchgaenge)" },
+                { value: "2", label: "Stufe 2 (DoD, 7 Durchgaenge)" },
+                { value: "3", label: "Stufe 3 (Gutmann, 35 Durchgaenge)" },
+              ]}
+            />
+          )}
+          <TextInput
+            label="Device-ID bestaetigen"
+            value={secureEraseConfirm}
+            onChange={(event) => setSecureEraseConfirm(event.currentTarget.value)}
+            placeholder={secureEraseDevice?.identifier ?? "diskX"}
+            description="Gib die Device-ID exakt ein, um fortzufahren."
+          />
+          <TextInput
+            label="Admin-Passwort"
+            type="password"
+            value={secureErasePassword}
+            onChange={(event) => setSecureErasePassword(event.currentTarget.value)}
+            placeholder="macOS Admin-Passwort"
+          />
+          {secureEraseError && (
+            <Text size="xs" c="red">
+              {secureEraseError}
+            </Text>
+          )}
+          <Group justify="flex-end" mt="sm">
+            <Button variant="default" onClick={() => setSecureEraseOpen(false)} disabled={secureEraseSubmitting}>
+              Abbrechen
+            </Button>
+            <Button color="red" loading={secureEraseSubmitting} onClick={submitSecureErase}>
+              Sicher loeschen
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
+      <Modal
+        opened={systemUnlockOpen}
+        onClose={() => {
+          setSystemUnlockOpen(false);
+          setSystemUnlockPassword("");
+          setSystemUnlockError(null);
+        }}
+        title="Systempartition entsperren"
+        centered
+      >
+        <Stack gap="sm">
+          <Text size="sm">
+            Diese Partition ist als Systempartition markiert. Falsche Aenderungen koennen das System unbootbar machen.
+          </Text>
+          <Text size="sm" c="dimmed">
+            Aktion: {systemUnlockActionLabel ?? "-"}
+          </Text>
+          {(selectedPartitionWarning || selectedApfsVolumeWarning) && (
+            <Text size="xs" c="red">
+              {selectedPartitionWarning ?? selectedApfsVolumeWarning}
+            </Text>
+          )}
+          <TextInput
+            label="Admin-Passwort"
+            type="password"
+            value={systemUnlockPassword}
+            onChange={(event) => setSystemUnlockPassword(event.currentTarget.value)}
+            placeholder="macOS Admin-Passwort"
+          />
+          {systemUnlockError && (
+            <Text size="xs" c="red">
+              {systemUnlockError}
+            </Text>
+          )}
+          <Group justify="flex-end" mt="sm">
+            <Button
+              variant="default"
+              onClick={() => {
+                setSystemUnlockOpen(false);
+                setSystemUnlockPassword("");
+                setSystemUnlockError(null);
+              }}
+              disabled={systemUnlockSubmitting}
+            >
+              Abbrechen
+            </Button>
+            <Button color="red" loading={systemUnlockSubmitting} onClick={confirmSystemUnlock}>
+              Ich verstehe, fortfahren
             </Button>
           </Group>
         </Stack>
@@ -3159,6 +3569,11 @@ export default function App() {
                     checked={showPowerDataInspector}
                     onChange={(event) => setShowPowerDataInspector(event.currentTarget.checked)}
                   />
+                  <Switch
+                    label="Virtuelle Disks anzeigen"
+                    checked={showVirtualDisks}
+                    onChange={(event) => setShowVirtualDisks(event.currentTarget.checked)}
+                  />
                 </Stack>
               </Menu.Dropdown>
             </Menu>
@@ -3270,6 +3685,10 @@ export default function App() {
               shadow="sm"
               style={{ flex: 1, minWidth: 260, display: "flex", flexDirection: "column", gap: 12 }}
             >
+              {(() => {
+                const devices = partitionManagerDevices(partitionDevices, showVirtualDisks);
+                return (
+                  <>
               <Group justify="space-between" align="center">
                 <div>
                   <Text c="dimmed" size="xs" tt="uppercase" fw={700}>
@@ -3290,7 +3709,7 @@ export default function App() {
                   </Stack>
                 </Center>
               )}
-              {!partitionLoading && partitionDevices.length === 0 && (
+              {!partitionLoading && devices.length === 0 && (
                 <Center style={{ flex: 1 }}>
                   <Stack align="center">
                     <ThemeIcon size={56} radius="xl" color="gray" variant="light">
@@ -3300,17 +3719,26 @@ export default function App() {
                   </Stack>
                 </Center>
               )}
-              {!partitionLoading && partitionDevices.length > 0 && (
+              {!partitionLoading && devices.length > 0 && (
                 <Stack gap="xs">
-                  {partitionDevices.map((device) => {
+                  {devices.map((device) => {
                     const active = device.identifier === selectedPartitionDeviceId;
+                    const isVirtual = !!device.is_virtual;
                     return (
                       <Paper
                         key={device.identifier}
                         withBorder
                         radius="md"
                         p="sm"
-                        className={active ? "device-card device-card--active" : "device-card"}
+                        className={
+                          [
+                            "device-card",
+                            active ? "device-card--active" : "",
+                            isVirtual ? "device-card--virtual" : "",
+                          ]
+                            .filter(Boolean)
+                            .join(" ")
+                        }
                         onClick={() => {
                           setSelectedPartitionDeviceId(device.identifier);
                           setSelectedPartitionId(device.partitions[0]?.identifier ?? null);
@@ -3323,15 +3751,22 @@ export default function App() {
                             <ThemeIcon
                               size={40}
                               radius="md"
-                              color={device.internal ? "gray" : "teal"}
+                              color={isVirtual ? "grape" : device.internal ? "gray" : "teal"}
                               variant="light"
                             >
                               {device.internal ? <IconDatabase size={20} /> : <IconDeviceFloppy size={20} />}
                             </ThemeIcon>
                             <div>
-                              <Text fw={600}>{device.identifier}</Text>
+                              <Group gap="xs" align="center">
+                                <Text fw={600}>{device.identifier}</Text>
+                                {isVirtual && (
+                                  <Badge size="xs" color="grape" variant="light">
+                                    Virtual
+                                  </Badge>
+                                )}
+                              </Group>
                               <Text size="xs" c="dimmed">
-                                {formatBytes(device.size)} · {device.internal ? "Intern" : "Extern"}
+                                {formatBytes(device.size)} · {isVirtual ? "Virtual" : device.internal ? "Intern" : "Extern"}
                               </Text>
                             </div>
                           </Group>
@@ -3346,6 +3781,9 @@ export default function App() {
                   })}
                 </Stack>
               )}
+                  </>
+                );
+              })()}
             </Paper>
 
             <Paper
@@ -3403,9 +3841,15 @@ export default function App() {
                   <Group justify="space-between" align="center">
                     <div>
                       <Text fw={700}>{selectedPartitionDevice.identifier}</Text>
-                      <Text size="sm" c="dimmed">
-                        {formatBytes(selectedPartitionDevice.size)} · {selectedPartitionDevice.internal ? "Intern" : "Extern"} · {selectedPartitionDevice.content}
-                      </Text>
+                      {selectionLocked ? (
+                        <Text size="sm" c="dimmed">
+                          {selectionDetails}
+                        </Text>
+                      ) : (
+                        <Text size="sm" c="dimmed">
+                          {formatBytes(selectedPartitionDevice.size)} · {selectedPartitionDevice.internal ? "Intern" : "Extern"} · {selectedPartitionDevice.content}
+                        </Text>
+                      )}
                     </div>
                     <Group gap="xs">
                       <Button
@@ -3415,6 +3859,15 @@ export default function App() {
                         disabled={selectedPartitionDevice.is_protected}
                       >
                         Geraet loeschen
+                      </Button>
+                      <Button
+                        size="xs"
+                        variant="light"
+                        color="red"
+                        onClick={() => openSecureEraseWizard(selectedPartitionDevice)}
+                        disabled={selectedPartitionDevice.is_protected}
+                      >
+                        Sicher loeschen
                       </Button>
                       <Button
                         size="xs"
@@ -3447,20 +3900,79 @@ export default function App() {
                     </Group>
                   </Group>
 
-                  <Paper withBorder radius="lg" p="md" className="partition-bar">
-                    <div className="partition-bar__scroll" ref={partitionBarRef}>
+                  <Group justify="space-between" align="center" className="partition-breadcrumbs">
+                    <Group gap="xs">
+                      <Button size="xs" variant={isApfsZoomed ? "subtle" : "light"} onClick={resetApfsZoom}>
+                        {selectedPartitionDevice.identifier}
+                      </Button>
+                      {isApfsZoomed && (
+                        <Text size="xs" c="dimmed">
+                          &gt;
+                        </Text>
+                      )}
+                      {isApfsZoomed && (
+                        <Button size="xs" variant="light" disabled>
+                          {zoomedContainerLabel}
+                        </Button>
+                      )}
+                    </Group>
+                    {apfsZoomLoading && (
+                      <Text size="xs" c="dimmed">
+                        Lade APFS Volumes…
+                      </Text>
+                    )}
+                  </Group>
+
+                  <Paper
+                    withBorder
+                    radius="lg"
+                    p="md"
+                    className={isApfsZoomed ? "partition-bar partition-bar--zoomed" : "partition-bar"}
+                  >
+                    {showApfsGroupBand && (
+                      <div className="partition-group-band">
+                        <div className="partition-group-band__track">
+                          {apfsGroupBands.map((band) => {
+                            const totalSize = apfsZoomContainer?.capacity ?? selectedPartitionDevice.size;
+                            const percent = totalSize > 0 ? (band.size / totalSize) * 100 : 0;
+                            const showLabel = percent >= 8;
+                            return (
+                              <div
+                                key={`group-${band.key}`}
+                                className="partition-group-segment"
+                                style={{ flexBasis: `${percent}%` }}
+                                title={band.label}
+                              >
+                                {showLabel && <span className="partition-group-label">{band.label}</span>}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                    <div className="partition-bar__scroll">
                       <div className="partition-bar__track">
                         {partitionSegments.map((segment) => {
                           const isSelected = segment.kind === "partition"
                             ? segment.partition?.identifier === selectedPartitionId
-                            : selectedUnallocated?.offset === segment.offset;
-                          const width = (segment.size / selectedPartitionDevice.size) * 100;
+                            : segment.kind === "apfs-volume"
+                              ? segment.volume?.identifier === selectedApfsVolumeId
+                              : segment.kind === "apfs-hidden"
+                                ? false
+                                : selectedUnallocated?.offset === segment.offset;
+                          const totalSize = apfsZoomContainer?.capacity ?? selectedPartitionDevice.size;
+                          const percent = totalSize > 0 ? (segment.size / totalSize) * 100 : 0;
                           const label = segment.kind === "unallocated" ? formatBytes(segment.size) : segment.label;
-                          const showLabel =
-                            partitionBarWidth > 0
-                              ? (partitionBarWidth * width) / 100 >= 40
-                              : width >= 8;
-                          const isLocked = !!segment.partition?.is_protected;
+                          const showLabel = percent >= 5;
+                          const contentType = (segment.partition?.content ?? "").toLowerCase();
+                          const isSystemType =
+                            contentType.includes("efi") ||
+                            contentType.includes("recovery") ||
+                            contentType.includes("apple_apfs_recovery") ||
+                            contentType.includes("apple_apfs_isc") ||
+                            contentType.includes("apple_boot");
+                          const isLocked = !!segment.partition?.is_protected || isSystemType;
+                          const isApfsContainer = segment.kind === "partition" && isApfsContainerPartition(segment.partition ?? null);
                           return (
                             <button
                               key={segment.key}
@@ -3474,24 +3986,54 @@ export default function App() {
                                   .filter(Boolean)
                                   .join(" ")
                               }
-                              style={{ width: `${width}%`, background: fsColorForSegment(segment.fsType, segment.kind) }}
+                              style={{
+                                flexBasis: `${percent}%`,
+                                background: fsColorForSegment(
+                                  segment.fsType,
+                                  segment.kind === "unallocated" ? "unallocated" : "partition"
+                                ),
+                              }}
+                              data-kind={segment.kind}
                               title={label}
                               onClick={() => {
                                 if (segment.kind === "partition" && segment.partition) {
+                                  if (!isApfsZoomed && isApfsContainer) {
+                                    loadApfsZoomContainer(segment.partition.identifier);
+                                    return;
+                                  }
                                   setSelectedPartitionId(segment.partition.identifier);
                                   setSelectedPartition(segment.partition);
                                   setSelectedUnallocated(null);
-                                } else {
+                                  setSelectedApfsVolumeId(null);
+                                  return;
+                                }
+                                if (segment.kind === "apfs-volume" && segment.volume) {
+                                  setSelectedApfsVolumeId(segment.volume.identifier);
                                   setSelectedPartitionId(null);
                                   setSelectedPartition(null);
-                                  setSelectedUnallocated({ offset: segment.offset, size: segment.size });
+                                  setSelectedUnallocated(null);
+                                  return;
                                 }
+                                if (segment.kind === "apfs-hidden") {
+                                  return;
+                                }
+                                setSelectedPartitionId(null);
+                                setSelectedPartition(null);
+                                setSelectedApfsVolumeId(null);
+                                setSelectedUnallocated({ offset: segment.offset, size: segment.size });
                               }}
                             >
                               {isLocked && <IconLock size={12} className="partition-segment__lock" />}
-                              <span className="partition-segment__label">
-                                {showLabel ? label : ""}
-                              </span>
+                              {showLabel && (
+                                <span className="partition-segment__label">
+                                  {label}
+                                  {showPowerDataInspector && segment.kind === "apfs-volume" && segment.volume?.roles.length ? (
+                                    <span className="partition-segment__meta">
+                                      {segment.volume.roles.join(", ")}
+                                    </span>
+                                  ) : null}
+                                </span>
+                              )}
                             </button>
                           );
                         })}
@@ -3501,13 +4043,19 @@ export default function App() {
 
                   <Group justify="space-between" align="center" mt="xs">
                     <Text size="sm" c="dimmed">
-                      Auswahl: {selectedPartition ? `${selectedPartition.identifier} · ${selectedPartition.name || ""}`.trim() : selectedUnallocated ? "Unallocated" : "-"}
+                      Auswahl: {selectedPartition
+                        ? `${selectedPartition.identifier} · ${selectedPartition.name || ""}`.trim()
+                        : selectedApfsVolumeId
+                          ? apfsZoomContainer?.volumes.find((vol) => vol.identifier === selectedApfsVolumeId)?.name || selectedApfsVolumeId
+                          : selectedUnallocated
+                            ? "Unallocated"
+                            : "-"}
                     </Text>
                     <Group gap="xs">
                       <Button
                         size="xs"
                         variant="light"
-                        disabled={!selectedPartition || selectedPartition.is_protected}
+                        disabled={!selectedPartition || isApfsZoomed}
                         onClick={() => selectedPartition && copyToClipboard(selectedPartition)}
                       >
                         Kopieren
@@ -3515,40 +4063,50 @@ export default function App() {
                       <Button
                         size="xs"
                         variant="light"
-                        disabled={!selectedPartition || selectedPartition.is_protected}
-                        onClick={() => selectedPartition && openFormatWizard(selectedPartition)}
+                        disabled={!selectedPartition || isApfsZoomed}
+                        onClick={() =>
+                          selectedPartition && requestSystemUnlock("Formatieren", () => openFormatWizard(selectedPartition))
+                        }
                       >
                         Formatieren
                       </Button>
                       <Button
                         size="xs"
                         variant="light"
-                        disabled={!selectedPartition || selectedPartition.is_protected}
-                        onClick={() => selectedPartition && openResizeWizard(selectedPartition)}
+                        disabled={!selectedPartition || isApfsZoomed}
+                        onClick={() =>
+                          selectedPartition && requestSystemUnlock("Groesse aendern", () => openResizeWizard(selectedPartition))
+                        }
                       >
                         Groesse
                       </Button>
                       <Button
                         size="xs"
                         variant="light"
-                        disabled={!selectedPartition || selectedPartition.is_protected}
-                        onClick={() => selectedPartition && openMoveWizard(selectedPartition)}
+                        disabled={!selectedPartition || isApfsZoomed}
+                        onClick={() =>
+                          selectedPartition && requestSystemUnlock("Verschieben", () => openMoveWizard(selectedPartition))
+                        }
                       >
                         Verschieben
                       </Button>
                       <Button
                         size="xs"
                         variant="light"
-                        disabled={!selectedPartition || selectedPartition.is_protected}
-                        onClick={() => selectedPartition && openCheckWizard(selectedPartition)}
+                        disabled={!selectedPartition || isApfsZoomed}
+                        onClick={() =>
+                          selectedPartition && requestSystemUnlock("Ueberpruefen", () => openCheckWizard(selectedPartition))
+                        }
                       >
                         Ueberpruefen
                       </Button>
                       <Button
                         size="xs"
                         variant="light"
-                        disabled={!selectedPartition || selectedPartition.is_protected}
-                        onClick={() => selectedPartition && openLabelWizard(selectedPartition)}
+                        disabled={!selectedPartition || isApfsZoomed}
+                        onClick={() =>
+                          selectedPartition && requestSystemUnlock("Label/UUID", () => openLabelWizard(selectedPartition))
+                        }
                       >
                         Label/UUID
                       </Button>
@@ -3556,8 +4114,8 @@ export default function App() {
                         <Button
                           size="xs"
                           variant="light"
-                          disabled={selectedPartition.is_protected}
-                          onClick={() => openApfsManager(selectedPartition)}
+                          disabled={isApfsZoomed}
+                          onClick={() => requestSystemUnlock("APFS Volumen verwalten", () => openApfsManager(selectedPartition))}
                         >
                           Volumen verwalten
                         </Button>
@@ -3566,18 +4124,31 @@ export default function App() {
                         size="xs"
                         variant="light"
                         color="red"
-                        disabled={!selectedPartition || selectedPartition.is_protected}
-                        onClick={() => selectedPartition && openDeleteWizard(selectedPartition)}
+                        disabled={!selectedPartition || isApfsZoomed}
+                        onClick={() =>
+                          selectedPartition && requestSystemUnlock("Loeschen", () => openDeleteWizard(selectedPartition))
+                        }
                       >
                         Loeschen
                       </Button>
                     </Group>
                   </Group>
-                  {selectedPartition?.is_protected && (
+                  {(selectedPartitionWarning || selectedApfsVolumeWarning) && (
                     <Text size="xs" c="dimmed">
-                      Systempartition (SIP) erkannt. Aenderungen sind gesperrt.
+                      {selectedPartitionWarning ?? selectedApfsVolumeWarning}
                     </Text>
                   )}
+                  {apfsZoomError && (
+                    <Text size="xs" c="red">
+                      {apfsZoomError}
+                    </Text>
+                  )}
+
+                  {(() => {
+                    const tableSegments = showPowerDataInspector
+                      ? partitionSegments
+                      : partitionSegments.filter((segment) => segment.kind !== "apfs-hidden");
+                    return (
 
                   <Paper withBorder radius="md" p="sm" className="partition-table">
                     <Table highlightOnHover verticalSpacing="sm">
@@ -3592,53 +4163,86 @@ export default function App() {
                         </Table.Tr>
                       </Table.Thead>
                       <Table.Tbody>
-                        {partitionSegments.map((segment) => {
+                        {tableSegments.map((segment) => {
                           const isSelected = segment.kind === "partition"
                             ? segment.partition?.identifier === selectedPartitionId
-                            : selectedUnallocated?.offset === segment.offset;
+                            : segment.kind === "apfs-volume"
+                              ? segment.volume?.identifier === selectedApfsVolumeId
+                              : selectedUnallocated?.offset === segment.offset;
                           const fsLabel = fsLabelForType(segment.fsType, segment.kind);
+                          const isExpanded = showPowerDataInspector && expandedPartitionKey === segment.key;
                           return (
-                            <Table.Tr
-                              key={`row-${segment.key}`}
-                              data-selected={isSelected}
-                              onClick={() => {
-                                if (segment.kind === "partition" && segment.partition) {
-                                  setSelectedPartitionId(segment.partition.identifier);
-                                  setSelectedPartition(segment.partition);
-                                  setSelectedUnallocated(null);
-                                } else {
-                                  setSelectedPartitionId(null);
-                                  setSelectedPartition(null);
-                                  setSelectedUnallocated({ offset: segment.offset, size: segment.size });
-                                }
-                              }}
-                            >
-                              <Table.Td>
-                                <span
-                                  className="partition-dot"
-                                  style={{ background: fsColorForSegment(segment.fsType, segment.kind) }}
-                                />
-                              </Table.Td>
+                            <>
+                              <Table.Tr
+                                key={`row-${segment.key}`}
+                                data-selected={isSelected}
+                                onClick={() => {
+                                  if (segment.kind === "partition" && segment.partition) {
+                                    setSelectedPartitionId(segment.partition.identifier);
+                                    setSelectedPartition(segment.partition);
+                                    setSelectedUnallocated(null);
+                                    setSelectedApfsVolumeId(null);
+                                  } else if (segment.kind === "apfs-volume" && segment.volume) {
+                                    setSelectedApfsVolumeId(segment.volume.identifier);
+                                    setSelectedPartitionId(null);
+                                    setSelectedPartition(null);
+                                    setSelectedUnallocated(null);
+                                  } else {
+                                    setSelectedPartitionId(null);
+                                    setSelectedPartition(null);
+                                    setSelectedApfsVolumeId(null);
+                                    setSelectedUnallocated({ offset: segment.offset, size: segment.size });
+                                  }
+                                }}
+                              >
+                                <Table.Td>
+                                  <Group gap="xs" wrap="nowrap">
+                                    {showPowerDataInspector && (
+                                      <ActionIcon
+                                        size="xs"
+                                        variant="subtle"
+                                        aria-label="Details umschalten"
+                                        onClick={(event) => {
+                                          event.stopPropagation();
+                                          togglePartitionDetails(segment.key);
+                                        }}
+                                      >
+                                        {isExpanded ? <IconChevronUp size={14} /> : <IconChevronDown size={14} />}
+                                      </ActionIcon>
+                                    )}
+                                    <span
+                                      className="partition-dot"
+                                      style={{ background: fsColorForSegment(segment.fsType, segment.kind) }}
+                                    />
+                                  </Group>
+                                </Table.Td>
                               <Table.Td>
                                 <Text fw={600} size="sm">
                                   {segment.kind === "unallocated"
                                     ? "Unallocated"
-                                    : segment.partition?.identifier}
+                                    : segment.kind === "apfs-volume"
+                                      ? segment.volume?.name || segment.volume?.identifier
+                                      : segment.partition?.identifier}
                                 </Text>
                                 {segment.partition?.name && (
                                   <Text size="xs" c="dimmed">
                                     {segment.partition.name}
                                   </Text>
                                 )}
+                                {segment.kind === "apfs-volume" && segment.volume?.identifier && (
+                                  <Text size="xs" c="dimmed">
+                                    {segment.volume.identifier}
+                                  </Text>
+                                )}
                               </Table.Td>
                               <Table.Td>
                                 <Text size="sm">
-                                  {segment.kind === "unallocated" ? "-" : fsLabel}
+                                  {segment.kind === "unallocated" ? "-" : segment.kind === "apfs-volume" ? "APFS Volume" : fsLabel}
                                 </Text>
                               </Table.Td>
                               <Table.Td>
                                 <Text size="sm" c="dimmed">
-                                  {segment.partition?.mount_point ?? "-"}
+                                  {segment.kind === "apfs-volume" ? segment.volume?.mountPoint ?? "-" : segment.partition?.mount_point ?? "-"}
                                 </Text>
                               </Table.Td>
                               <Table.Td>
@@ -3647,22 +4251,145 @@ export default function App() {
                                 </Text>
                               </Table.Td>
                               <Table.Td>
-                                {segment.partition?.is_protected ? (
-                                  <Text size="xs" c="red">
-                                    SIP
-                                  </Text>
-                                ) : (
-                                  <Text size="xs" c="dimmed">
-                                    -
-                                  </Text>
-                                )}
+                                {(() => {
+                                  if (segment.kind === "apfs-volume") {
+                                    const warning = apfsVolumeWarning(segment.volume ?? null);
+                                    const rolesText = showPowerDataInspector
+                                      ? segment.volume?.roles.join(", ") ?? ""
+                                      : "";
+                                    return (
+                                      <Group gap="xs">
+                                        {warning && (
+                                          <Tooltip label={warning} withArrow>
+                                            <span>
+                                              <IconLock size={12} color="var(--mantine-color-red-6)" />
+                                            </span>
+                                          </Tooltip>
+                                        )}
+                                        {rolesText ? (
+                                          <Text size="xs" c="dimmed">
+                                            {rolesText}
+                                          </Text>
+                                        ) : (
+                                          <Text size="xs" c="dimmed">
+                                            -
+                                          </Text>
+                                        )}
+                                      </Group>
+                                    );
+                                  }
+
+                                  const warning = systemPartitionWarning(segment.partition ?? null);
+                                  if (warning) {
+                                    return (
+                                      <Tooltip label={warning} withArrow>
+                                        <span>
+                                          <IconLock size={12} color="var(--mantine-color-red-6)" />
+                                        </span>
+                                      </Tooltip>
+                                    );
+                                  }
+
+                                  return (
+                                    <Text size="xs" c="dimmed">
+                                      -
+                                    </Text>
+                                  );
+                                })()}
                               </Table.Td>
-                            </Table.Tr>
+                              </Table.Tr>
+                              {isExpanded && (
+                                <Table.Tr key={`detail-${segment.key}`} className="partition-table__detail">
+                                  <Table.Td colSpan={6}>
+                                    <div className="partition-detail-grid">
+                                      {segment.kind === "partition" && segment.partition && (
+                                        <>
+                                          <div className="partition-detail-item">
+                                            <b>Identifier:</b> {segment.partition.identifier}
+                                          </div>
+                                          <div className="partition-detail-item">
+                                            <b>Name:</b> {segment.partition.name || "-"}
+                                          </div>
+                                          <div className="partition-detail-item">
+                                            <b>Content:</b> {segment.partition.content || "-"}
+                                          </div>
+                                          <div className="partition-detail-item">
+                                            <b>FS-Type:</b> {segment.partition.fs_type || fsLabel}
+                                          </div>
+                                          <div className="partition-detail-item">
+                                            <b>Mount:</b> {segment.partition.mount_point || "-"}
+                                          </div>
+                                          <div className="partition-detail-item">
+                                            <b>Groesse:</b> {formatBytes(segment.partition.size)}
+                                          </div>
+                                          <div className="partition-detail-item">
+                                            <b>Offset:</b> {segment.partition.offset != null ? formatBytes(segment.partition.offset) : "-"}
+                                          </div>
+                                          <div className="partition-detail-item">
+                                            <b>Schutz:</b> {segment.partition.is_protected ? "SIP" : "-"}
+                                          </div>
+                                          <div className="partition-detail-item">
+                                            <b>Grund:</b> {segment.partition.protection_reason || "-"}
+                                          </div>
+                                        </>
+                                      )}
+                                      {segment.kind === "apfs-volume" && segment.volume && (
+                                        <>
+                                          <div className="partition-detail-item">
+                                            <b>Identifier:</b> {segment.volume.identifier}
+                                          </div>
+                                          <div className="partition-detail-item">
+                                            <b>Name:</b> {segment.volume.name || "-"}
+                                          </div>
+                                          <div className="partition-detail-item">
+                                            <b>Gruppe:</b> {segment.volume.volumeGroupName || segment.volume.volumeGroupUuid || "-"}
+                                          </div>
+                                          <div className="partition-detail-item">
+                                            <b>Group Role:</b> {segment.volume.volumeGroupRole || "-"}
+                                          </div>
+                                          <div className="partition-detail-item">
+                                            <b>Rollen:</b> {segment.volume.roles.join(", ") || "-"}
+                                          </div>
+                                          <div className="partition-detail-item">
+                                            <b>Sealed:</b>{" "}
+                                            {segment.volume.sealed == null ? "-" : segment.volume.sealed ? "Ja" : "Nein"}
+                                          </div>
+                                          <div className="partition-detail-item">
+                                            <b>Groesse:</b> {formatBytes(segment.volume.size)}
+                                          </div>
+                                          <div className="partition-detail-item">
+                                            <b>Belegt:</b> {formatBytes(segment.volume.used)}
+                                          </div>
+                                          <div className="partition-detail-item">
+                                            <b>Mount:</b> {segment.volume.mountPoint || "-"}
+                                          </div>
+                                        </>
+                                      )}
+                                      {segment.kind === "unallocated" && (
+                                        <>
+                                          <div className="partition-detail-item">
+                                            <b>Typ:</b> Unallocated
+                                          </div>
+                                          <div className="partition-detail-item">
+                                            <b>Groesse:</b> {formatBytes(segment.size)}
+                                          </div>
+                                          <div className="partition-detail-item">
+                                            <b>Offset:</b> {formatBytes(segment.offset)}
+                                          </div>
+                                        </>
+                                      )}
+                                    </div>
+                                  </Table.Td>
+                                </Table.Tr>
+                              )}
+                            </>
                           );
                         })}
                       </Table.Tbody>
                     </Table>
                   </Paper>
+                    );
+                  })()}
                 </>
               )}
             </Paper>

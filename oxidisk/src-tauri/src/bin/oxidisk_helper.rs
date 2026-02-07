@@ -60,6 +60,7 @@ fn main() {
         "set_label_uuid" => handle_set_label_uuid(&request.payload),
         "preflight_check" => handle_preflight_check(&request.payload),
         "force_unmount" => handle_force_unmount(&request.payload),
+        "secure_erase" => handle_secure_erase(&request.payload),
         "apfs_list_volumes" => handle_apfs_list_volumes(&request.payload),
         "apfs_add_volume" => handle_apfs_add_volume(&request.payload),
         "apfs_delete_volume" => handle_apfs_delete_volume(&request.payload),
@@ -121,6 +122,58 @@ fn handle_wipe_device(payload: &Value) -> Result<Option<Value>, String> {
         sync_kernel_table(&device);
     }
     result
+}
+
+fn handle_secure_erase(payload: &Value) -> Result<Option<Value>, String> {
+    let device_identifier = read_string(payload, "deviceIdentifier")?;
+    let level = read_u64(payload, "level")?;
+
+    let device = normalize_device(&device_identifier);
+    let info = disk_info_dict(&device)?;
+    let is_internal = info
+        .get("Internal")
+        .and_then(|v| v.as_boolean())
+        .unwrap_or(false);
+    let is_solid_state = info
+        .get("SolidState")
+        .and_then(|v| v.as_boolean())
+        .unwrap_or(false);
+    let bus_protocol = info
+        .get("BusProtocol")
+        .and_then(|v| v.as_string())
+        .unwrap_or("")
+        .to_string();
+
+    force_unmount_disk(&device)?;
+
+    if is_internal && is_solid_state {
+        let container = find_apfs_container_for_disk(&device)?;
+        run_diskutil(["apfs", "deleteContainer", &container])?;
+        sync_kernel_table(&device);
+        return Ok(Some(json!({
+            "device": device,
+            "mode": "crypto",
+            "container": container,
+            "busProtocol": bus_protocol,
+        })));
+    }
+
+    let level_str = match level {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        other => return Err(format!("Unsupported secure erase level: {other}")),
+    };
+
+    run_diskutil(["secureErase", level_str, &device])?;
+    sync_kernel_table(&device);
+    Ok(Some(json!({
+        "device": device,
+        "mode": "secureErase",
+        "level": level,
+        "busProtocol": bus_protocol,
+    })))
 }
 
 fn handle_create_partition_table(payload: &Value) -> Result<Option<Value>, String> {
@@ -358,6 +411,13 @@ fn handle_apfs_list_volumes(payload: &Value) -> Result<Option<Value>, String> {
             let identifier = plist_string(volume_dict, &["DeviceIdentifier", "DeviceReference"]).unwrap_or_default();
             let name = plist_string(volume_dict, &["Name", "VolumeName"]).unwrap_or_default();
             let roles = plist_string_array(volume_dict, &["Roles", "APFSVolumeRoles"]);
+            let volume_group_uuid = plist_string(volume_dict, &["VolumeGroupUUID", "APFSVolumeGroupUUID"]);
+            let volume_group_role = plist_string(volume_dict, &["VolumeGroupRole", "APFSVolumeGroupRole"]);
+            let volume_group_name = plist_string(volume_dict, &["VolumeGroupName", "APFSVolumeGroupName"]);
+            let sealed = volume_dict
+                .get("Sealed")
+                .and_then(|v| v.as_boolean())
+                .or_else(|| volume_dict.get("IsSealed").and_then(|v| v.as_boolean()));
             let size = plist_u64(volume_dict, &["CapacityInUse", "CapacityInUseBytes", "CapacityUsed"]).unwrap_or(0);
             let used = plist_u64(volume_dict, &["CapacityInUse", "CapacityInUseBytes", "CapacityUsed"]).unwrap_or(0);
             let mount_point = plist_string(volume_dict, &["MountPoint"]);
@@ -366,6 +426,10 @@ fn handle_apfs_list_volumes(payload: &Value) -> Result<Option<Value>, String> {
                 "identifier": identifier,
                 "name": name,
                 "roles": roles,
+                "volumeGroupUuid": volume_group_uuid,
+                "volumeGroupRole": volume_group_role,
+                "volumeGroupName": volume_group_name,
+                "sealed": sealed,
                 "size": size,
                 "used": used,
                 "mountPoint": mount_point,
@@ -908,6 +972,13 @@ fn read_string(payload: &Value, key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("Missing field: {key}"))
 }
 
+fn read_u64(payload: &Value, key: &str) -> Result<u64, String> {
+    payload
+        .get(key)
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| format!("Missing field: {key}"))
+}
+
 struct BatteryStatus {
     is_laptop: bool,
     on_ac: bool,
@@ -972,6 +1043,82 @@ fn read_mount_point(device: &str) -> Result<Option<String>, String> {
         .get("MountPoint")
         .and_then(|v| v.as_string())
         .map(|s| s.to_string()))
+}
+
+fn disk_info_dict(device: &str) -> Result<plist::Dictionary, String> {
+    let output = Command::new("diskutil")
+        .args(["info", "-plist", device])
+        .output()
+        .map_err(|e| format!("diskutil failed: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("diskutil error: {stderr}"));
+    }
+    let plist = PlistValue::from_reader_xml(&output.stdout[..]).map_err(|e| e.to_string())?;
+    plist
+        .as_dictionary()
+        .cloned()
+        .ok_or_else(|| "Invalid plist".to_string())
+}
+
+fn base_disk_identifier(device: &str) -> String {
+    let needle = strip_device_prefix(device);
+    if let Some(pos) = needle.find('s') {
+        return needle[..pos].to_string();
+    }
+    needle
+}
+
+fn find_apfs_container_for_disk(device: &str) -> Result<String, String> {
+    let base_disk = base_disk_identifier(device);
+    let output = Command::new("diskutil")
+        .args(["apfs", "list", "-plist"])
+        .output()
+        .map_err(|e| format!("diskutil failed: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("diskutil error: {stderr}"));
+    }
+
+    let plist = PlistValue::from_reader_xml(&output.stdout[..]).map_err(|e| e.to_string())?;
+    let dict = plist
+        .as_dictionary()
+        .ok_or_else(|| "Invalid plist".to_string())?;
+    let containers = dict
+        .get("Containers")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "Invalid APFS plist structure".to_string())?;
+
+    for container in containers {
+        let container_dict = match container.as_dictionary() {
+            Some(d) => d,
+            None => continue,
+        };
+        let physical_stores = match container_dict
+            .get("PhysicalStores")
+            .and_then(|v| v.as_array())
+        {
+            Some(arr) => arr,
+            None => continue,
+        };
+        for store in physical_stores {
+            let store_dict = match store.as_dictionary() {
+                Some(d) => d,
+                None => continue,
+            };
+            let store_id = plist_string(store_dict, &["DeviceIdentifier"]).unwrap_or_default();
+            if store_id.starts_with(&base_disk) {
+                let container_identifier = plist_string(
+                    container_dict,
+                    &["ContainerReference", "DeviceIdentifier", "ContainerIdentifier"],
+                )
+                .unwrap_or_else(|| base_disk.clone());
+                return Ok(container_identifier);
+            }
+        }
+    }
+
+    Err("APFS container not found for disk".to_string())
 }
 
 fn list_open_processes(mount_point: &str) -> Result<Vec<ProcessInfo>, String> {

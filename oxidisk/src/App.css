@@ -43,8 +43,17 @@
   background-color: var(--oxidisk-card-active);
 }
 
+.device-card--virtual {
+  border-color: rgba(168, 85, 247, 0.35);
+  background: rgba(168, 85, 247, 0.06);
+}
+
 .partition-bar {
   background: var(--mantine-color-body);
+}
+
+.partition-bar--zoomed .partition-bar__track {
+  animation: partitionSlideIn 0.35s ease;
 }
 
 .partition-bar__track {
@@ -54,14 +63,16 @@
   overflow: hidden;
   border: 1px solid var(--oxidisk-bar-border);
   height: 52px;
-  min-width: 520px;
-  width: max-content;
+  width: 100%;
+}
+
+.partition-breadcrumbs {
+  padding: 4px 0 2px;
 }
 
 .partition-bar__scroll {
-  overflow-x: auto;
+  overflow-x: hidden;
   overflow-y: hidden;
-  padding-bottom: 6px;
 }
 
 .partition-segment {
@@ -74,12 +85,13 @@
   justify-content: center;
   font-size: 12px;
   font-weight: 600;
-  color: #0f172a;
+  color: #f8fafc;
   cursor: pointer;
   transition: filter 0.2s ease, box-shadow 0.2s ease;
   min-width: 6px;
-  flex: 0 0 auto;
+  flex: 1 1 0;
   position: relative;
+  border-right: 1px solid rgba(255, 255, 255, 0.2);
 }
 
 .partition-segment:hover {
@@ -107,10 +119,105 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  text-shadow: 0 1px 2px rgba(15, 23, 42, 0.45);
+}
+
+.partition-segment__meta {
+  display: block;
+  font-size: 10px;
+  opacity: 0.8;
+  text-shadow: none;
+}
+
+.partition-group-band {
+  margin-bottom: 10px;
+}
+
+.partition-group-band__track {
+  display: flex;
+  height: 18px;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid rgba(15, 23, 42, 0.12);
+  background: rgba(15, 23, 42, 0.06);
+}
+
+.partition-group-segment {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 600;
+  color: rgba(15, 23, 42, 0.8);
+  background: rgba(56, 189, 248, 0.18);
+  border-right: 1px solid rgba(15, 23, 42, 0.08);
+  min-width: 4px;
+  padding: 0 6px;
+  white-space: nowrap;
+}
+
+.partition-group-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.partition-segment[data-kind="unallocated"] {
+  color: #334155;
+}
+
+.partition-segment[data-kind="unallocated"] .partition-segment__label {
+  text-shadow: none;
+}
+
+@keyframes partitionSlideIn {
+  0% {
+    transform: translateX(12px);
+    opacity: 0.6;
+  }
+  100% {
+    transform: translateX(0);
+    opacity: 1;
+  }
 }
 
 .partition-table tbody tr[data-selected="true"] {
   background: rgba(59, 130, 246, 0.08);
+}
+
+.partition-table table {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+.partition-table th,
+.partition-table td {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.partition-table__detail td {
+  background: rgba(15, 23, 42, 0.04);
+  padding-top: 8px;
+  padding-bottom: 12px;
+}
+
+.partition-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 6px 16px;
+}
+
+.partition-detail-item {
+  font-size: 12px;
+  color: var(--mantine-color-dimmed);
+}
+
+.partition-detail-item b {
+  color: var(--mantine-color-text);
+  font-weight: 600;
 }
 
 .partition-dot {

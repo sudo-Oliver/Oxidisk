@@ -3,8 +3,10 @@
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::UNIX_EPOCH;
 use sysinfo::Disks;
 
@@ -331,6 +333,41 @@ fn move_to_trash(path: String) -> Result<(), String> {
     trash::delete(path).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn validate_admin_password(password: String) -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    {
+        if password.trim().is_empty() {
+            return Ok(false);
+        }
+
+        let mut child = Command::new("sudo")
+            .args(["-k", "-S", "-p", "", "true"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("sudo start failed: {e}"))?;
+
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin
+                .write_all(format!("{}\n", password).as_bytes())
+                .map_err(|e| format!("sudo stdin failed: {e}"))?;
+        }
+
+        let output = child
+            .wait_with_output()
+            .map_err(|e| format!("sudo failed: {e}"))?;
+        return Ok(output.status.success());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = password;
+        Ok(false)
+    }
+}
+
 // Hilfsfunktion für schöne Strings direkt aus Rust
 fn format_bytes(bytes: u64) -> String {
     const UNIT: u64 = 1024;
@@ -353,8 +390,10 @@ fn main() {
             scan_directory,
             open_in_finder,
             move_to_trash,
+            validate_admin_password,
             partitioning::get_partition_devices,
             partitioning::wipe_device,
+            partitioning::secure_erase,
             partitioning::create_partition_table,
             partitioning::create_partition,
             partitioning::delete_partition,

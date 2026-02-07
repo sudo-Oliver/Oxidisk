@@ -12,6 +12,8 @@ pub struct PartitionDevice {
     identifier: String,
     size: u64,
     internal: bool,
+    is_solid_state: bool,
+    bus_protocol: Option<String>,
     content: String,
     parent_device: Option<String>,
     partitions: Vec<PartitionEntry>,
@@ -51,6 +53,12 @@ pub struct WipeDeviceRequest {
     table_type: String,
     format_type: String,
     label: String,
+}
+
+#[derive(Deserialize)]
+pub struct SecureEraseRequest {
+    device_identifier: String,
+    level: u64,
 }
 
 #[derive(Deserialize)]
@@ -177,6 +185,10 @@ pub struct ApfsVolumeInfo {
     identifier: String,
     name: String,
     roles: Vec<String>,
+    volume_group_uuid: Option<String>,
+    volume_group_role: Option<String>,
+    volume_group_name: Option<String>,
+    sealed: Option<bool>,
     size: u64,
     used: u64,
     mount_point: Option<String>,
@@ -273,6 +285,14 @@ pub fn get_partition_devices() -> Vec<PartitionDevice> {
 
             let size = disk_dict.get("Size").and_then(|v| v.as_unsigned_integer()).unwrap_or(0);
             let internal = !disk_external_flag(&identifier, disk_dict);
+            let is_solid_state = disk_dict
+                .get("SolidState")
+                .and_then(|v| v.as_boolean())
+                .unwrap_or(false);
+            let bus_protocol = disk_dict
+                .get("BusProtocol")
+                .and_then(|v| v.as_string())
+                .map(|s| s.to_string());
             let content = disk_dict
                 .get("Content")
                 .and_then(|v| v.as_string())
@@ -355,6 +375,8 @@ pub fn get_partition_devices() -> Vec<PartitionDevice> {
                 identifier,
                 size,
                 internal,
+                is_solid_state,
+                bus_protocol,
                 content,
                 parent_device,
                 partitions,
@@ -921,6 +943,24 @@ pub fn wipe_device(app: tauri::AppHandle, request: WipeDeviceRequest) -> Result<
         &app,
         HelperRequest {
             action: "wipe_device".to_string(),
+            payload,
+        },
+    )?;
+
+    ok_or_message(response)
+}
+
+#[tauri::command]
+pub fn secure_erase(app: tauri::AppHandle, request: SecureEraseRequest) -> Result<HelperResponse, String> {
+    let payload = json!({
+        "deviceIdentifier": request.device_identifier,
+        "level": request.level,
+    });
+
+    let response = run_helper(
+        &app,
+        HelperRequest {
+            action: "secure_erase".to_string(),
             payload,
         },
     )?;
