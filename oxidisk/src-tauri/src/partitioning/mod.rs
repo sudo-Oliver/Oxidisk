@@ -107,6 +107,13 @@ pub struct CopyPartitionRequest {
 }
 
 #[derive(Deserialize)]
+pub struct FlashImageRequest {
+    source_path: String,
+    target_device: String,
+    verify: Option<bool>,
+}
+
+#[derive(Deserialize)]
 pub struct PreflightRequest {
     device_identifier: Option<String>,
     partition_identifier: Option<String>,
@@ -119,6 +126,40 @@ pub struct PreflightRequest {
 pub struct ForceUnmountRequest {
     device_identifier: Option<String>,
     partition_identifier: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ApfsAddVolumeRequest {
+    container_identifier: String,
+    name: String,
+    role: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ApfsDeleteVolumeRequest {
+    volume_identifier: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApfsVolumeInfo {
+    identifier: String,
+    name: String,
+    roles: Vec<String>,
+    size: u64,
+    used: u64,
+    mount_point: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApfsContainerInfo {
+    container_identifier: String,
+    container_uuid: Option<String>,
+    capacity: Option<u64>,
+    capacity_free: Option<u64>,
+    capacity_used: Option<u64>,
+    volumes: Vec<ApfsVolumeInfo>,
 }
 
 #[derive(Serialize)]
@@ -897,6 +938,30 @@ pub fn copy_partition(
 }
 
 #[tauri::command]
+pub fn flash_image(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    request: FlashImageRequest,
+) -> Result<HelperResponse, String> {
+    let payload = json!({
+        "sourcePath": request.source_path,
+        "targetDevice": request.target_device,
+        "verify": request.verify.unwrap_or(true),
+    });
+
+    let response = run_helper_stream(
+        &app,
+        &window,
+        HelperRequest {
+            action: "flash_image".to_string(),
+            payload,
+        },
+    )?;
+
+    ok_or_message(response)
+}
+
+#[tauri::command]
 pub fn preflight_partition(
     app: tauri::AppHandle,
     request: PreflightRequest,
@@ -961,6 +1026,68 @@ pub fn clear_operation_journal(app: tauri::AppHandle) -> Result<HelperResponse, 
         HelperRequest {
             action: "clear_journal".to_string(),
             payload: json!({}),
+        },
+    )?;
+
+    ok_or_message(response)
+}
+
+#[tauri::command]
+pub fn apfs_list_volumes(app: tauri::AppHandle, container_identifier: String) -> Result<ApfsContainerInfo, String> {
+    let payload = json!({
+        "containerIdentifier": container_identifier,
+    });
+
+    let response = run_helper(
+        &app,
+        HelperRequest {
+            action: "apfs_list_volumes".to_string(),
+            payload,
+        },
+    )?;
+
+    let response = ok_or_message(response)?;
+    let details = response
+        .details
+        .ok_or_else(|| "APFS details missing".to_string())?;
+    let info: ApfsContainerInfo = serde_json::from_value(details)
+        .map_err(|e| format!("Invalid APFS details: {e}"))?;
+    Ok(info)
+}
+
+#[tauri::command]
+pub fn apfs_add_volume(app: tauri::AppHandle, request: ApfsAddVolumeRequest) -> Result<HelperResponse, String> {
+    let payload = json!({
+        "containerIdentifier": request.container_identifier,
+        "name": request.name,
+        "role": request.role,
+    });
+
+    let response = run_helper(
+        &app,
+        HelperRequest {
+            action: "apfs_add_volume".to_string(),
+            payload,
+        },
+    )?;
+
+    ok_or_message(response)
+}
+
+#[tauri::command]
+pub fn apfs_delete_volume(
+    app: tauri::AppHandle,
+    request: ApfsDeleteVolumeRequest,
+) -> Result<HelperResponse, String> {
+    let payload = json!({
+        "volumeIdentifier": request.volume_identifier,
+    });
+
+    let response = run_helper(
+        &app,
+        HelperRequest {
+            action: "apfs_delete_volume".to_string(),
+            payload,
         },
     )?;
 

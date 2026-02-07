@@ -29,4 +29,5 @@ sysinfo = "0.30"
 open = "5.3.3"
 trash = "5.2.5"
 plist = "1.6"
+sha2 = "0.10"
 

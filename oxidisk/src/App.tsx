@@ -43,6 +43,7 @@ import {
   IconFolder,
   IconTrash,
   IconLock,
+  IconDatabase,
 } from "@tabler/icons-react";
 import { ResponsiveSunburst } from "@nivo/sunburst";
 import "./App.css";
@@ -130,6 +131,24 @@ interface OperationJournal {
   updatedAt?: number;
 }
 
+interface ApfsVolumeInfo {
+  identifier: string;
+  name: string;
+  roles: string[];
+  size: number;
+  used: number;
+  mountPoint?: string | null;
+}
+
+interface ApfsContainerInfo {
+  containerIdentifier: string;
+  containerUuid?: string | null;
+  capacity?: number | null;
+  capacityFree?: number | null;
+  capacityUsed?: number | null;
+  volumes: ApfsVolumeInfo[];
+}
+
 const CHART_COLORS = ["#0A84FF", "#5E5CE6", "#64D2FF", "#30D158", "#40CBE0", "#7DDBEE"];
 
 // --- HELPER ---
@@ -147,7 +166,7 @@ function formatDate(seconds: number) {
 
 export default function App() {
   const [opened, { toggle }] = useDisclosure();
-  const [activeView, setActiveView] = useState<"analyzer" | "partition">("analyzer");
+  const [activeView, setActiveView] = useState<"analyzer" | "partition" | "images">("analyzer");
   const [disks, setDisks] = useState<SystemDisk[]>([]);
   const [scanData, setScanData] = useState<FileNode | null>(null);
   const [loading, setLoading] = useState(false);
@@ -183,6 +202,24 @@ export default function App() {
   const [labelError, setLabelError] = useState<string | null>(null);
   const [labelSubmitting, setLabelSubmitting] = useState(false);
   const [labelSuccess, setLabelSuccess] = useState<string | null>(null);
+  const [apfsManagerOpen, setApfsManagerOpen] = useState(false);
+  const [apfsTarget, setApfsTarget] = useState<PartitionEntry | null>(null);
+  const [apfsContainer, setApfsContainer] = useState<ApfsContainerInfo | null>(null);
+  const [apfsLoading, setApfsLoading] = useState(false);
+  const [apfsError, setApfsError] = useState<string | null>(null);
+  const [apfsAddName, setApfsAddName] = useState("");
+  const [apfsAddRole, setApfsAddRole] = useState("None");
+  const [apfsAddSubmitting, setApfsAddSubmitting] = useState(false);
+  const [apfsAddError, setApfsAddError] = useState<string | null>(null);
+  const [apfsDeleteBusy, setApfsDeleteBusy] = useState<string | null>(null);
+  const [imagePath, setImagePath] = useState<string | null>(null);
+  const [imageTarget, setImageTarget] = useState<string>("");
+  const [imageVerify, setImageVerify] = useState(true);
+  const [imageConfirmText, setImageConfirmText] = useState("");
+  const [imageError, setImageError] = useState<string | null>(null);
+  const [imageSuccess, setImageSuccess] = useState<string | null>(null);
+  const [imageRunning, setImageRunning] = useState(false);
+  const [showAllImageTargets, setShowAllImageTargets] = useState(false);
   const [createWizardOpen, setCreateWizardOpen] = useState(false);
   const [createDevice, setCreateDevice] = useState<PartitionDevice | null>(null);
   const [createFormatType, setCreateFormatType] = useState("exfat");
@@ -436,6 +473,150 @@ export default function App() {
       const normalized = (part.fs_type ?? part.content ?? "").toLowerCase();
       return normalized.includes("apfs") || normalized.includes("apple_apfs");
     });
+  }
+
+  const apfsRoleOptions = ["None", "System", "Data", "Preboot", "Recovery", "VM"];
+  const apfsProtectedRoles = new Set(["System", "Data", "Preboot", "Recovery", "VM"]);
+
+  function apfsVolumeProtected(volume: ApfsVolumeInfo) {
+    return volume.roles.some((role) => apfsProtectedRoles.has(role));
+  }
+
+  async function loadApfsContainer(containerIdentifier: string) {
+    setApfsLoading(true);
+    setApfsError(null);
+    try {
+      const result = await invoke<ApfsContainerInfo>("apfs_list_volumes", { containerIdentifier });
+      setApfsContainer(result);
+    } catch (error) {
+      setApfsError(String(error));
+    } finally {
+      setApfsLoading(false);
+    }
+  }
+
+  function openApfsManager(partition: PartitionEntry) {
+    setApfsTarget(partition);
+    setApfsAddName("");
+    setApfsAddRole("None");
+    setApfsAddError(null);
+    setApfsContainer(null);
+    setApfsManagerOpen(true);
+    loadApfsContainer(partition.identifier);
+  }
+
+  async function submitApfsAddVolume() {
+    if (!apfsTarget) return;
+    const name = apfsAddName.trim();
+    if (!name) {
+      setApfsAddError("Bitte einen Volume-Namen angeben.");
+      return;
+    }
+
+    setApfsAddSubmitting(true);
+    setApfsAddError(null);
+    try {
+      await invoke("apfs_add_volume", {
+        containerIdentifier: apfsTarget.identifier,
+        name,
+        role: showPowerDataInspector ? apfsAddRole : "None",
+      });
+      setApfsAddName("");
+      await loadApfsContainer(apfsTarget.identifier);
+    } catch (error) {
+      setApfsAddError(String(error));
+    } finally {
+      setApfsAddSubmitting(false);
+    }
+  }
+
+  async function submitApfsDeleteVolume(volume: ApfsVolumeInfo) {
+    if (!apfsTarget) return;
+    if (!window.confirm(`Volume ${volume.identifier} wirklich loeschen?`)) {
+      return;
+    }
+
+    setApfsDeleteBusy(volume.identifier);
+    try {
+      await invoke("apfs_delete_volume", { volumeIdentifier: volume.identifier });
+      await loadApfsContainer(apfsTarget.identifier);
+    } catch (error) {
+      setApfsError(String(error));
+    } finally {
+      setApfsDeleteBusy(null);
+    }
+  }
+
+  async function chooseImageFile() {
+    try {
+      const selected = await openDialog({
+        multiple: false,
+        title: "Image auswaehlen",
+        filters: [{ name: "Images", extensions: ["iso", "img", "dmg", "dd"] }],
+      });
+      if (typeof selected === "string") {
+        setImagePath(selected);
+        setImageError(null);
+        setImageSuccess(null);
+      }
+    } catch (error) {
+      setImageError(String(error));
+    }
+  }
+
+  function imageTargetOptions() {
+    const targets = showAllImageTargets
+      ? partitionDevices
+      : partitionDevices.filter((device) => !device.internal);
+    return targets.map((device) => ({
+      value: device.identifier,
+      label: `${device.identifier} · ${formatBytes(device.size)} · ${device.internal ? "Intern" : "Extern"}`,
+    }));
+  }
+
+  async function submitFlashImage() {
+    if (!imagePath) {
+      setImageError("Bitte ein Image auswaehlen.");
+      return;
+    }
+    if (!imageTarget) {
+      setImageError("Bitte ein Zielgeraet auswaehlen.");
+      return;
+    }
+    if (imageConfirmText.trim() !== imageTarget) {
+      setImageError("Bitte die Device-ID exakt eingeben.");
+      return;
+    }
+
+    setImageRunning(true);
+    setImageError(null);
+    setImageSuccess(null);
+    setProgressLog([]);
+    setProgressOpen(true);
+    setProgressMessage("Starte Flash...");
+
+    try {
+      const result = await invoke<{ details?: { sourceHash?: string; verifiedHash?: string } }>("flash_image", {
+        sourcePath: imagePath,
+        targetDevice: imageTarget,
+        verify: imageVerify,
+      });
+      const sourceHash = result?.details?.sourceHash;
+      const verifiedHash = result?.details?.verifiedHash;
+      const message = sourceHash
+        ? `Flash abgeschlossen. SHA-256: ${sourceHash}${verifiedHash ? " (verifiziert)" : ""}`
+        : "Flash abgeschlossen.";
+      setImageSuccess(message);
+      setImageConfirmText("");
+      await loadPartitionDevices();
+    } catch (error) {
+      setImageError(String(error));
+    } finally {
+      setImageRunning(false);
+      setProgressOpen(false);
+      setProgressMessage(null);
+      setProgressBytes(null);
+    }
   }
 
   function openCreateWizard(device: PartitionDevice) {
@@ -1162,7 +1343,7 @@ export default function App() {
   }, [showSystemVolumes, activeView]);
 
   useEffect(() => {
-    if (activeView === "partition") {
+    if (activeView === "partition" || activeView === "images") {
       loadPartitionDevices();
       loadOperationJournal();
     }
@@ -1452,6 +1633,14 @@ export default function App() {
           </Group>
         </Stack>
       </Modal>
+      <Modal opened={!!imageSuccess} onClose={() => setImageSuccess(null)} title="Flash abgeschlossen" centered>
+        <Stack gap="sm">
+          <Text size="sm">{imageSuccess}</Text>
+          <Group justify="flex-end" mt="md">
+            <Button onClick={() => setImageSuccess(null)}>OK</Button>
+          </Group>
+        </Stack>
+      </Modal>
       <Modal opened={sudoSetupOpen} onClose={() => setSudoSetupOpen(false)} title="Helper einrichten" centered>
         <Stack gap="sm">
           <Text size="sm" c="dimmed">
@@ -1525,6 +1714,115 @@ export default function App() {
             </Button>
             <Button color="red" onClick={submitFormatWizard} loading={formatSubmitting}>
               Formatieren
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
+      <Modal opened={apfsManagerOpen} onClose={() => setApfsManagerOpen(false)} title="APFS Volumes" centered size="lg">
+        <Stack gap="sm">
+          <Text size="sm" c="dimmed">
+            Container: <b>{apfsTarget?.identifier ?? "-"}</b>
+          </Text>
+          {apfsLoading && <Text size="sm" c="dimmed">Lade APFS-Container…</Text>}
+          {apfsError && (
+            <Text size="sm" c="red">
+              {apfsError}
+            </Text>
+          )}
+          {apfsContainer && (() => {
+            const capacity = apfsContainer.capacity ?? 0;
+            const used =
+              apfsContainer.capacityUsed ??
+              (apfsContainer.capacity != null && apfsContainer.capacityFree != null
+                ? apfsContainer.capacity - apfsContainer.capacityFree
+                : 0);
+            if (!capacity) return null;
+            const percent = Math.min(100, Math.round((used / capacity) * 100));
+            return (
+              <Stack gap={4}>
+                <Text size="xs" c="dimmed">
+                  Belegt: {formatBytes(used)} von {formatBytes(capacity)}
+                </Text>
+                <Slider value={percent} min={0} max={100} step={1} disabled />
+              </Stack>
+            );
+          })()}
+          <Divider />
+          {apfsContainer && apfsContainer.volumes.length === 0 && (
+            <Text size="sm" c="dimmed">
+              Keine Volumes gefunden.
+            </Text>
+          )}
+          {apfsContainer && apfsContainer.volumes.length > 0 && (
+            <Stack gap="xs">
+              {apfsContainer.volumes.map((volume) => (
+                <Group key={volume.identifier} justify="space-between" align="center">
+                  <div>
+                    <Text size="sm" fw={600}>
+                      {volume.name || volume.identifier}
+                    </Text>
+                    <Text size="xs" c="dimmed">
+                      {volume.identifier}
+                      {volume.mountPoint ? ` · ${volume.mountPoint}` : ""}
+                    </Text>
+                    {volume.roles.length > 0 && (
+                      <Group gap="xs" mt={4}>
+                        {volume.roles.map((role) => (
+                          <Badge key={`${volume.identifier}-${role}`} variant="light">
+                            {role}
+                          </Badge>
+                        ))}
+                      </Group>
+                    )}
+                  </div>
+                  <Group gap="xs">
+                    <Text size="xs" c="dimmed">
+                      {formatBytes(volume.used || volume.size)}
+                    </Text>
+                    <Button
+                      size="xs"
+                      color="red"
+                      variant="light"
+                      loading={apfsDeleteBusy === volume.identifier}
+                      disabled={apfsVolumeProtected(volume)}
+                      onClick={() => submitApfsDeleteVolume(volume)}
+                    >
+                      Loeschen
+                    </Button>
+                  </Group>
+                </Group>
+              ))}
+            </Stack>
+          )}
+          <Divider />
+          <Text fw={600} size="sm">
+            Neues Volume
+          </Text>
+          <TextInput
+            label="Name"
+            value={apfsAddName}
+            onChange={(event) => setApfsAddName(event.currentTarget.value)}
+            placeholder="OXIDISK"
+          />
+          {showPowerDataInspector && (
+            <NativeSelect
+              label="Role (optional)"
+              value={apfsAddRole}
+              onChange={(event) => setApfsAddRole(event.currentTarget.value)}
+              data={apfsRoleOptions.map((role) => ({ value: role, label: role }))}
+            />
+          )}
+          {apfsAddError && (
+            <Text size="sm" c="red">
+              {apfsAddError}
+            </Text>
+          )}
+          <Group justify="flex-end" mt="sm">
+            <Button variant="default" onClick={() => setApfsManagerOpen(false)} disabled={apfsAddSubmitting}>
+              Schliessen
+            </Button>
+            <Button onClick={submitApfsAddVolume} loading={apfsAddSubmitting}>
+              Volume erstellen
             </Button>
           </Group>
         </Stack>
@@ -2291,6 +2589,19 @@ export default function App() {
             color={activeView === "partition" ? "orange" : "gray"}
             style={{ borderRadius: 8, marginBottom: 12 }}
           />
+          <NavLink
+            label={<Text fw={600}>Image Writer</Text>}
+            leftSection={
+              <ThemeIcon color="teal" variant="light">
+                <IconDeviceFloppy size={16} />
+              </ThemeIcon>
+            }
+            active={activeView === "images"}
+            onClick={() => setActiveView("images")}
+            variant="filled"
+            color={activeView === "images" ? "teal" : "gray"}
+            style={{ borderRadius: 8, marginBottom: 12 }}
+          />
 
           <Text size="xs" fw={700} c="dimmed" mb="sm" tt="uppercase">
             Deine Laufwerke
@@ -2504,6 +2815,16 @@ export default function App() {
                               >
                                 Formatieren
                               </Button>
+                              {fsTypeFromPartition(part) === "apfs" && (
+                                <Button
+                                  size="xs"
+                                  variant="light"
+                                  disabled={part.is_protected}
+                                  onClick={() => openApfsManager(part)}
+                                >
+                                  Volumen verwalten
+                                </Button>
+                              )}
                               <Button
                                 size="xs"
                                 variant="light"
@@ -2564,6 +2885,111 @@ export default function App() {
                   ))}
                 </Stack>
               )}
+            </Paper>
+          </Group>
+        )}
+
+        {activeView === "images" && (
+          <Group h="100%" gap="md" align="stretch">
+            <Paper withBorder p="md" radius="md" shadow="sm" style={{ flex: 2, display: "flex", flexDirection: "column", gap: 12 }}>
+              <Group justify="space-between" align="center">
+                <div>
+                  <Text c="dimmed" size="xs" tt="uppercase" fw={700}>
+                    Image Writer
+                  </Text>
+                  <Title order={3}>Flash Images auf USB/SD</Title>
+                  <Text size="sm" c="dimmed">
+                    Schreibe ISO/IMG/DMG direkt auf einen Stick. Optional mit SHA-256 Verifikation.
+                  </Text>
+                </div>
+                <Group gap="xs">
+                  <Button variant="light" onClick={loadPartitionDevices} leftSection={<IconRefresh size={18} />}
+                    >
+                    Neu laden
+                  </Button>
+                </Group>
+              </Group>
+              <Divider />
+
+              <Stack gap="md">
+                <Paper withBorder radius="md" p="md">
+                  <Stack gap="xs">
+                    <Text fw={600}>Quelle</Text>
+                    <Group gap="xs" align="center">
+                      <Button variant="light" onClick={chooseImageFile}>
+                        Image auswaehlen
+                      </Button>
+                      <Text size="sm" c={imagePath ? "" : "dimmed"}>
+                        {imagePath ?? "Keine Datei gewaehlt"}
+                      </Text>
+                    </Group>
+                  </Stack>
+                </Paper>
+
+                <Paper withBorder radius="md" p="md">
+                  <Stack gap="xs">
+                    <Group justify="space-between" align="center">
+                      <Text fw={600}>Zielgeraet</Text>
+                      <Switch
+                        label="Alle Laufwerke"
+                        checked={showAllImageTargets}
+                        onChange={(event) => setShowAllImageTargets(event.currentTarget.checked)}
+                      />
+                    </Group>
+                    <NativeSelect
+                      label="USB/SD Target"
+                      value={imageTarget}
+                      onChange={(event) => setImageTarget(event.currentTarget.value)}
+                      data={imageTargetOptions()}
+                      placeholder="Geraet waehlen"
+                    />
+                    {imageTargetOptions().length === 0 && (
+                      <Text size="xs" c="dimmed">
+                        Keine externen Laufwerke gefunden. Aktiviere "Alle Laufwerke" um interne Disks zu sehen.
+                      </Text>
+                    )}
+                  </Stack>
+                </Paper>
+
+                <Paper withBorder radius="md" p="md">
+                  <Stack gap="xs">
+                    <Text fw={600}>Einstellungen</Text>
+                    <Switch
+                      label="SHA-256 Verifikation"
+                      checked={imageVerify}
+                      onChange={(event) => setImageVerify(event.currentTarget.checked)}
+                    />
+                  </Stack>
+                </Paper>
+
+                <Paper withBorder radius="md" p="md">
+                  <Stack gap="xs">
+                    <Text fw={600}>Flash</Text>
+                    <TextInput
+                      label="Device-ID bestaetigen"
+                      value={imageConfirmText}
+                      onChange={(event) => setImageConfirmText(event.currentTarget.value)}
+                      placeholder={imageTarget || "diskX"}
+                      description="Gib die Device-ID exakt ein, um fortzufahren."
+                    />
+                    {imageError && (
+                      <Text size="sm" c="red">
+                        {imageError}
+                      </Text>
+                    )}
+                    <Group justify="flex-end" mt="sm">
+                      <Button
+                        color="red"
+                        onClick={submitFlashImage}
+                        loading={imageRunning}
+                        disabled={!imagePath || !imageTarget}
+                      >
+                        Flash starten
+                      </Button>
+                    </Group>
+                  </Stack>
+                </Paper>
+              </Stack>
             </Paper>
           </Group>
         )}

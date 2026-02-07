@@ -1,6 +1,7 @@
 use plist::Value as PlistValue;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::process::Command;
@@ -52,6 +53,10 @@ fn main() {
         "set_label_uuid" => handle_set_label_uuid(&request.payload),
         "preflight_check" => handle_preflight_check(&request.payload),
         "force_unmount" => handle_force_unmount(&request.payload),
+        "apfs_list_volumes" => handle_apfs_list_volumes(&request.payload),
+        "apfs_add_volume" => handle_apfs_add_volume(&request.payload),
+        "apfs_delete_volume" => handle_apfs_delete_volume(&request.payload),
+        "flash_image" => handle_flash_image(&request.payload),
         "get_journal" => handle_get_journal(),
         "clear_journal" => handle_clear_journal(),
         _ => Err("Unknown action".to_string()),
@@ -281,6 +286,165 @@ fn handle_set_label_uuid(payload: &Value) -> Result<Option<Value>, String> {
     sync_kernel_table(&device);
 
     Ok(Some(json!({ "device": device, "label": label, "uuid": uuid, "fs": fs_type })))
+}
+
+fn handle_apfs_list_volumes(payload: &Value) -> Result<Option<Value>, String> {
+    let container_identifier = read_string(payload, "containerIdentifier")?;
+    let normalized = normalize_device(&container_identifier);
+    let needle = strip_device_prefix(&normalized);
+
+    let output = Command::new("diskutil")
+        .args(["apfs", "list", "-plist"])
+        .output()
+        .map_err(|e| format!("diskutil failed: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("diskutil error: {stderr}"));
+    }
+
+    let plist = PlistValue::from_reader_xml(&output.stdout[..]).map_err(|e| e.to_string())?;
+    let dict = plist
+        .as_dictionary()
+        .ok_or_else(|| "Invalid plist".to_string())?;
+
+    let containers = dict
+        .get("Containers")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "Invalid APFS plist structure".to_string())?;
+
+    for container in containers {
+        let container_dict = match container.as_dictionary() {
+            Some(d) => d,
+            None => continue,
+        };
+
+        if !container_matches(container_dict, &needle) {
+            continue;
+        }
+
+        let container_identifier = plist_string(container_dict, &["ContainerReference", "DeviceIdentifier", "ContainerIdentifier"])
+            .unwrap_or_else(|| needle.clone());
+        let container_uuid = plist_string(container_dict, &["APFSContainerUUID", "ContainerUUID"]);
+        let capacity = plist_u64(container_dict, &["CapacityCeiling", "Capacity"]);
+        let capacity_free = plist_u64(container_dict, &["CapacityFree"]);
+        let capacity_used = plist_u64(container_dict, &["CapacityInUse", "CapacityUsed"]);
+
+        let mut volume_entries: Vec<&PlistValue> = Vec::new();
+        if let Some(arr) = container_dict.get("Volumes").and_then(|v| v.as_array()) {
+            volume_entries.extend(arr.iter());
+        } else if let Some(arr) = container_dict.get("APFSVolumes").and_then(|v| v.as_array()) {
+            volume_entries.extend(arr.iter());
+        }
+
+        let mut volumes = Vec::new();
+        for volume in volume_entries {
+            let volume_dict = match volume.as_dictionary() {
+                Some(d) => d,
+                None => continue,
+            };
+
+            let identifier = plist_string(volume_dict, &["DeviceIdentifier", "DeviceReference"]).unwrap_or_default();
+            let name = plist_string(volume_dict, &["Name", "VolumeName"]).unwrap_or_default();
+            let roles = plist_string_array(volume_dict, &["Roles", "APFSVolumeRoles"]);
+            let size = plist_u64(volume_dict, &["CapacityInUse", "CapacityInUseBytes", "CapacityUsed"]).unwrap_or(0);
+            let used = plist_u64(volume_dict, &["CapacityInUse", "CapacityInUseBytes", "CapacityUsed"]).unwrap_or(0);
+            let mount_point = plist_string(volume_dict, &["MountPoint"]);
+
+            volumes.push(json!({
+                "identifier": identifier,
+                "name": name,
+                "roles": roles,
+                "size": size,
+                "used": used,
+                "mountPoint": mount_point,
+            }));
+        }
+
+        return Ok(Some(json!({
+            "containerIdentifier": container_identifier,
+            "containerUuid": container_uuid,
+            "capacity": capacity,
+            "capacityFree": capacity_free,
+            "capacityUsed": capacity_used,
+            "volumes": volumes,
+        })));
+    }
+
+    Err("APFS container not found".to_string())
+}
+
+fn handle_apfs_add_volume(payload: &Value) -> Result<Option<Value>, String> {
+    let container_identifier = read_string(payload, "containerIdentifier")?;
+    let name = read_string(payload, "name")?;
+    let role = payload
+        .get("role")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
+    let container = normalize_device(&container_identifier);
+    if role.trim().is_empty() || role == "None" {
+        run_diskutil(["apfs", "addVolume", &container, "APFS", &name])?;
+    } else {
+        run_diskutil(["apfs", "addVolume", &container, "APFS", &name, "-role", &role])?;
+    }
+
+    Ok(Some(json!({ "container": container, "name": name, "role": role })))
+}
+
+fn handle_apfs_delete_volume(payload: &Value) -> Result<Option<Value>, String> {
+    let volume_identifier = read_string(payload, "volumeIdentifier")?;
+    let volume = normalize_device(&volume_identifier);
+    run_diskutil(["apfs", "deleteVolume", &volume])?;
+    Ok(Some(json!({ "volume": volume })))
+}
+
+fn handle_flash_image(payload: &Value) -> Result<Option<Value>, String> {
+    let source_path = read_string(payload, "sourcePath")?;
+    let target_device = read_string(payload, "targetDevice")?;
+    let verify = payload
+        .get("verify")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let device = normalize_device(&target_device);
+    let raw_device = raw_device_path(&device);
+
+    let file_size = std::fs::metadata(&source_path)
+        .map_err(|e| format!("Image read failed: {e}"))?
+        .len();
+
+    let disk_size = read_disk_size(&device).unwrap_or(0);
+    if disk_size > 0 && file_size > disk_size {
+        return Err("Image is larger than target device".to_string());
+    }
+
+    emit_log("flash", "Unmounting target disk");
+    force_unmount_disk(&device)?;
+
+    emit_log("flash", "Writing image");
+    let source_hash = flash_write_with_hash(&source_path, &raw_device, file_size)?;
+
+    let mut verified_hash: Option<String> = None;
+    if verify {
+        emit_log("flash", "Verifying image");
+        let hash = flash_verify_with_hash(&raw_device, file_size)?;
+        if hash != source_hash {
+            return Err("Verification failed: checksum mismatch".to_string());
+        }
+        verified_hash = Some(hash);
+    }
+
+    sync_kernel_table(&device);
+
+    Ok(Some(json!({
+        "target": device,
+        "bytes": file_size,
+        "sourceHash": source_hash,
+        "verifiedHash": verified_hash,
+        "verified": verify,
+    })))
 }
 
 fn handle_preflight_check(payload: &Value) -> Result<Option<Value>, String> {
@@ -866,6 +1030,108 @@ fn normalize_device(identifier: &str) -> String {
     } else {
         format!("/dev/{identifier}")
     }
+}
+
+fn raw_device_path(device: &str) -> String {
+    if device.contains("/dev/rdisk") {
+        device.to_string()
+    } else if let Some(stripped) = device.strip_prefix("/dev/disk") {
+        format!("/dev/rdisk{stripped}")
+    } else {
+        device.replace("/dev/", "/dev/r")
+    }
+}
+
+fn read_disk_size(device: &str) -> Option<u64> {
+    let output = Command::new("diskutil")
+        .args(["info", "-plist", device])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let plist = PlistValue::from_reader_xml(&output.stdout[..]).ok()?;
+    let dict = plist.as_dictionary()?;
+    dict.get("TotalSize")
+        .and_then(|v| v.as_unsigned_integer())
+        .or_else(|| dict.get("Size").and_then(|v| v.as_unsigned_integer()))
+}
+
+fn flash_write_with_hash(source_path: &str, target_device: &str, total_bytes: u64) -> Result<String, String> {
+    if total_bytes == 0 {
+        return Err("Image is empty".to_string());
+    }
+
+    let mut source = std::fs::OpenOptions::new()
+        .read(true)
+        .open(source_path)
+        .map_err(|e| format!("Open image failed: {e}"))?;
+    let mut target = std::fs::OpenOptions::new()
+        .write(true)
+        .open(target_device)
+        .map_err(|e| format!("Open target failed: {e}"))?;
+
+    let buffer_size = 4 * 1024 * 1024;
+    let mut buffer = vec![0u8; buffer_size];
+    let mut remaining = total_bytes;
+    let mut copied: u64 = 0;
+    let progress_step: u64 = 50 * 1024 * 1024;
+    let mut next_progress = progress_step;
+    let mut hasher = Sha256::new();
+
+    while remaining > 0 {
+        let chunk = std::cmp::min(buffer_size as u64, remaining) as usize;
+        source.read_exact(&mut buffer[..chunk]).map_err(|e| e.to_string())?;
+        target.write_all(&buffer[..chunk]).map_err(|e| e.to_string())?;
+        hasher.update(&buffer[..chunk]);
+        remaining -= chunk as u64;
+        copied += chunk as u64;
+        if copied >= next_progress || remaining == 0 {
+            let percent = ((copied as f64 / total_bytes as f64) * 100.0).round() as u64;
+            emit_progress_bytes("flash", percent, 100, Some("Writing image"), copied, total_bytes);
+            next_progress += progress_step;
+        }
+    }
+
+    target.flush().map_err(|e| format!("Flush failed: {e}"))?;
+
+    let hash = hasher.finalize();
+    Ok(format!("{:x}", hash))
+}
+
+fn flash_verify_with_hash(target_device: &str, total_bytes: u64) -> Result<String, String> {
+    if total_bytes == 0 {
+        return Err("Image is empty".to_string());
+    }
+
+    let mut target = std::fs::OpenOptions::new()
+        .read(true)
+        .open(target_device)
+        .map_err(|e| format!("Open target failed: {e}"))?;
+
+    let buffer_size = 4 * 1024 * 1024;
+    let mut buffer = vec![0u8; buffer_size];
+    let mut remaining = total_bytes;
+    let mut copied: u64 = 0;
+    let progress_step: u64 = 50 * 1024 * 1024;
+    let mut next_progress = progress_step;
+    let mut hasher = Sha256::new();
+
+    while remaining > 0 {
+        let chunk = std::cmp::min(buffer_size as u64, remaining) as usize;
+        target.read_exact(&mut buffer[..chunk]).map_err(|e| e.to_string())?;
+        hasher.update(&buffer[..chunk]);
+        remaining -= chunk as u64;
+        copied += chunk as u64;
+        if copied >= next_progress || remaining == 0 {
+            let percent = ((copied as f64 / total_bytes as f64) * 100.0).round() as u64;
+            emit_progress_bytes("verify", percent, 100, Some("Verifying image"), copied, total_bytes);
+            next_progress += progress_step;
+        }
+    }
+
+    let hash = hasher.finalize();
+    Ok(format!("{:x}", hash))
 }
 
 fn create_linux_partition(device: &str, fs: &str, label: &str, size: &str) -> Result<Option<Value>, String> {
@@ -1542,6 +1808,92 @@ fn validate_uuid(uuid: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn strip_device_prefix(identifier: &str) -> String {
+    identifier.trim_start_matches("/dev/").to_string()
+}
+
+fn plist_string(dict: &std::collections::BTreeMap<String, PlistValue>, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(value) = dict.get(*key).and_then(|v| v.as_string()) {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn plist_u64(dict: &std::collections::BTreeMap<String, PlistValue>, keys: &[&str]) -> Option<u64> {
+    for key in keys {
+        if let Some(value) = dict.get(*key) {
+            if let Some(u) = value.as_unsigned_integer() {
+                return Some(u);
+            }
+            if let Some(i) = value.as_integer() {
+                if i >= 0 {
+                    return Some(i as u64);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn plist_string_array(dict: &std::collections::BTreeMap<String, PlistValue>, keys: &[&str]) -> Vec<String> {
+    for key in keys {
+        if let Some(arr) = dict.get(*key).and_then(|v| v.as_array()) {
+            return arr
+                .iter()
+                .filter_map(|v| v.as_string())
+                .map(|s| s.to_string())
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+fn container_matches(container_dict: &std::collections::BTreeMap<String, PlistValue>, needle: &str) -> bool {
+    if let Some(reference) = plist_string(container_dict, &["ContainerReference", "DeviceIdentifier", "ContainerIdentifier"]) {
+        if strip_device_prefix(&reference) == needle {
+            return true;
+        }
+    }
+
+    let mut store_entries: Vec<&PlistValue> = Vec::new();
+    if let Some(arr) = container_dict.get("PhysicalStores").and_then(|v| v.as_array()) {
+        store_entries.extend(arr.iter());
+    } else if let Some(arr) = container_dict.get("APFSPhysicalStores").and_then(|v| v.as_array()) {
+        store_entries.extend(arr.iter());
+    }
+
+    for store in store_entries {
+        if let Some(store_dict) = store.as_dictionary() {
+            if let Some(identifier) = plist_string(store_dict, &["DeviceIdentifier"]) {
+                if strip_device_prefix(&identifier) == needle {
+                    return true;
+                }
+            }
+        }
+    }
+
+    let mut volume_entries: Vec<&PlistValue> = Vec::new();
+    if let Some(arr) = container_dict.get("Volumes").and_then(|v| v.as_array()) {
+        volume_entries.extend(arr.iter());
+    } else if let Some(arr) = container_dict.get("APFSVolumes").and_then(|v| v.as_array()) {
+        volume_entries.extend(arr.iter());
+    }
+
+    for volume in volume_entries {
+        if let Some(volume_dict) = volume.as_dictionary() {
+            if let Some(identifier) = plist_string(volume_dict, &["DeviceIdentifier", "DeviceReference"]) {
+                if strip_device_prefix(&identifier) == needle {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 fn run_sidecar<I, S>(binary: &str, args: I) -> Result<(), String>

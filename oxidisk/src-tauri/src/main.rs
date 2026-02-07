@@ -372,6 +372,10 @@ fn main() {
             partitioning::clear_operation_journal,
             partitioning::get_sidecar_status,
             partitioning::get_partition_bounds,
+            partitioning::apfs_list_volumes,
+            partitioning::apfs_add_volume,
+            partitioning::apfs_delete_volume,
+            partitioning::flash_image,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
