@@ -25,12 +25,6 @@ import {
   ActionIcon,
   Modal,
   Divider,
-          {selectedPartition &&
-            renderPreflightBlock({
-              operation: "format",
-              partitionIdentifier: selectedPartition.identifier,
-              formatType: formatType,
-            })}
   NativeSelect,
   TextInput,
   Tooltip,
@@ -40,17 +34,6 @@ import {
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import {
-            <Button
-              onClick={submitFormatWizard}
-              loading={formatSubmitting}
-              disabled={!preflightReady(
-                preflightKeyFor({
-                  operation: "format",
-                  device: selectedPartition?.identifier ?? "",
-                  formatType: formatType,
-                })
-              )}
-            >
   IconChartPie,
   IconSettings,
   IconRefresh,

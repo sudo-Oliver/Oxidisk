@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 use tauri::path::BaseDirectory;
+use tauri::{Emitter, Manager};
 
 #[derive(Serialize)]
 pub struct PartitionDevice {
@@ -1141,7 +1142,7 @@ fn partition_bounds_for_disk(disk: &str, device: &str, size: u64) -> Result<(u64
     let mut next_start: Option<u64> = None;
     let current_id = device.trim_start_matches("/dev/");
 
-    for (idx, (identifier, offset, psize)) in entries.iter().enumerate() {
+    for (idx, (identifier, _offset, _psize)) in entries.iter().enumerate() {
         if identifier == current_id {
             if idx > 0 {
                 let (.., prev_offset, prev_size) = entries[idx - 1];
